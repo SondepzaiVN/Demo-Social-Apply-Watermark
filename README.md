@@ -1,27 +1,34 @@
-# Watermark Social local demo
+# Watermark Social
 
-The React interface calls `watermark_api.py`, which invokes the project's
-SIFT/JPEG-grid watermark pipeline rather than generating a UI-only key.
+```text
+web/
+├── frontend/                 # React + Vite social-network interface
+├── backend/                  # Local HTTP API connected to the research pipeline
+│   ├── watermark_api.py
+│   └── runtime/              # Generated images, .npz keys, API logs (not source)
+└── README.md
 
-## Start it
-
-From the repository root, use a Python 3.10--3.12 environment with the
-research dependencies installed:
-
-```powershell
-py -3 -m pip install -r Code\requirements.txt
-py -3 web\watermark_api.py
+Code/
+├── models/                   # Core SIFT/JPEG-grid watermark implementation
+└── scripts/                  # Research, benchmark, and platform experiment scripts
 ```
 
-In another terminal:
+## Run locally
+
+Terminal 1 — API and research pipeline:
 
 ```powershell
-cd web\web-watermark-new
+C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe web\backend\watermark_api.py
+```
+
+Terminal 2 — frontend:
+
+```powershell
+cd web\frontend
 npm run dev
 ```
 
-Open the Vite address shown in the terminal, normally `http://localhost:5173`.
-
-Generated watermarked images, originals, and `.npz` keys are kept locally in
-`web/runtime/`. The browser also saves the feed and its local copyright vault
-in `localStorage`.
+Open the Vite address shown in Terminal 2 (normally `http://localhost:5173`).
+The backend stores accounts, persistent sessions, the shared newsfeed,
+generated watermarked images, and `.npz` synchronization keys under
+`web/backend/runtime/`. The browser only keeps the current login token.

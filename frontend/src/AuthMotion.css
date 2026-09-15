@@ -1,0 +1,21 @@
+/* Keep the authentication card anchored while its form content changes. */
+.auth-page-simple {
+  align-items: start;
+  justify-items: center;
+  padding-top: max(32px, calc((100vh - 640px) / 2));
+}
+
+.auth-card-simple {
+  min-height: 640px;
+}
+
+@media (max-width: 600px) {
+  .auth-page-simple {
+    align-items: start;
+    padding-top: 15px;
+  }
+
+  .auth-card-simple {
+    min-height: 0;
+  }
+}
