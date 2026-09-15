@@ -1,10 +1,11 @@
 """Local persistent API for Watermark Social."""
 from __future__ import annotations
 
-import base64, hashlib, hmac, json, re, secrets, sys, tempfile, threading, uuid
+import base64, hashlib, hmac, json, os, re, secrets, sys, tempfile, threading, uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -18,7 +19,7 @@ from models.watermark_pipeline import (  # noqa: E402
 
 RUNTIME = Path(__file__).resolve().parent / "runtime"
 RUNTIME.mkdir(exist_ok=True)
-USERS_FILE, POSTS_FILE, SESSIONS_FILE = (RUNTIME / name for name in ("users.json", "posts.json", "sessions.json"))
+USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE = (RUNTIME / name for name in ("users.json", "posts.json", "sessions.json", "verification_history.json", "notifications.json"))
 DATA_LOCK = threading.RLock()
 FACEBOOK_MAX_SIDE, FACEBOOK_PREUPLOAD_JPEG_QUALITY = 2048, 100
 
@@ -110,6 +111,50 @@ def data_url_to_image(data_url: str) -> np.ndarray:
     return image
 
 
+def native_path(path: Path) -> str:
+    """Return a Windows extended-length path for libraries that do not add it."""
+    value = str(path.resolve())
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        return "\\\\?\\" + value
+    return value
+
+
+def unlink_file(path: Path) -> None:
+    try:
+        os.remove(native_path(path))
+    except FileNotFoundError:
+        pass
+
+
+def read_file_bytes(path: Path) -> bytes:
+    with open(native_path(path), "rb") as source:
+        return source.read()
+
+
+def read_image(path: Path) -> np.ndarray:
+    """Read through NumPy so Windows long paths work with OpenCV."""
+    source = native_path(path)
+    if not os.path.isfile(source):
+        raise FileNotFoundError(f"Không tìm thấy ảnh bài viết: {path.name}")
+    image = cv2.imdecode(np.fromfile(source, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"File ảnh bài viết không hợp lệ: {path.name}")
+    return image
+
+
+def write_image(path: Path, image: np.ndarray) -> None:
+    """Encode first, then write through NumPy for Windows long-path support."""
+    ok, encoded = cv2.imencode(
+        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, FACEBOOK_PREUPLOAD_JPEG_QUALITY]
+    )
+    if not ok:
+        raise ValueError(f"Không thể mã hóa ảnh: {path.name}")
+    destination = native_path(path)
+    encoded.tofile(destination)
+    if not os.path.isfile(destination) or os.path.getsize(destination) == 0:
+        raise OSError(f"Không thể lưu ảnh: {path.name}")
+
+
 def resize_for_facebook(image: np.ndarray) -> np.ndarray:
     height, width = image.shape[:2]; longest = max(width, height)
     if longest <= FACEBOOK_MAX_SIDE: return image
@@ -132,36 +177,66 @@ def embed(image_data: str, account_id: str) -> dict:
     if not positions: raise ValueError("Ảnh không có đủ vùng đặc trưng ổn định để nhúng watermark.")
     artifact_id = str(uuid.uuid4())
     original_path, marked_path, key_path = (RUNTIME / f"{artifact_id}_{suffix}" for suffix in ("original.jpg", "watermarked.jpg", "key.npz"))
-    cv2.imwrite(str(original_path), host); cv2.imwrite(str(marked_path), marked)
-    save_key_file(str(key_path), positions, safe_kp, safe_des, watermark.shape, raw.shape, alpha, seed, "text", account_id, "", repeat_k, payload_repeat, "utf-8", str(original_path), "", include_length_header=True)
-    return {"id": artifact_id, "imageFile": marked_path.name, "keyFile": key_path.name}
+    try:
+        write_image(original_path, host); write_image(marked_path, marked)
+        save_key_file(native_path(key_path), positions, safe_kp, safe_des, watermark.shape, raw.shape, alpha, seed, "text", account_id, "", repeat_k, payload_repeat, "utf-8", str(original_path), "", include_length_header=True)
+        return {"id": artifact_id, "imageFile": marked_path.name, "keyFile": key_path.name}
+    except Exception:
+        for path in (original_path, marked_path, key_path): unlink_file(path)
+        raise
 
 
 def public_post(post: dict, viewer: str = "") -> dict:
-    image_path = RUNTIME / post["imageFile"]
-    image = cv2.imread(str(image_path))
-    return {**{k: v for k, v in post.items() if k not in {"imageFile", "keyFile", "likedBy"}}, "image": image_to_data_url(image), "likes": len(post.get("likedBy", [])), "liked": viewer in post.get("likedBy", [])}
+    artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post["imageFile"], "keyFile": post["keyFile"]}]
+    images = [image_to_data_url(read_image(RUNTIME / artifact["imageFile"])) for artifact in artifacts]
+    public = {k: v for k, v in post.items() if k not in {"artifacts", "imageFile", "keyFile", "likedBy"}}
+    return {**public, "image": images[0], "images": images, "comments": post.get("comments", []), "likes": len(post.get("likedBy", [])), "liked": viewer in post.get("likedBy", [])}
 
 
-def create_post(image_data: str, caption: str, username: str, user: dict) -> dict:
-    artifact = embed(image_data, user["accountId"])
-    post = {"id": artifact["id"], "username": username, "author": user["displayName"], "accountId": user["accountId"], "caption": caption.strip() or "Ảnh không có tiêu đề", "imageFile": artifact["imageFile"], "keyFile": artifact["keyFile"], "createdAt": datetime.now(timezone.utc).isoformat(), "likedBy": [], "reported": False}
-    with DATA_LOCK:
-        posts = read_json(POSTS_FILE, []); posts.insert(0, post); write_json(POSTS_FILE, posts)
-    return public_post(post, username)
+def create_post(image_data: str | list[str], caption: str, username: str, user: dict) -> dict:
+    image_items = image_data if isinstance(image_data, list) else [image_data]
+    if not image_items or len(image_items) > 10:
+        raise ValueError("Mỗi bài viết cần từ 1 đến 10 ảnh.")
+    artifacts = []
+    try:
+        for item in image_items:
+            artifacts.append(embed(item, user["accountId"]))
+        post = {"id": str(uuid.uuid4()), "username": username, "author": user["displayName"], "accountId": user["accountId"], "caption": caption.strip(), "artifacts": artifacts, "createdAt": datetime.now(timezone.utc).isoformat(), "likedBy": [], "comments": [], "reported": False}
+        # Confirm every generated image can be read before publishing metadata.
+        result = public_post(post, username)
+        with DATA_LOCK:
+            posts = read_json(POSTS_FILE, []); posts.insert(0, post); write_json(POSTS_FILE, posts)
+        return result
+    except Exception:
+        for artifact in artifacts:
+            for field in ("imageFile", "keyFile"):
+                unlink_file(RUNTIME / artifact[field])
+            unlink_file(RUNTIME / f"{artifact['id']}_original.jpg")
+        raise
 
 
 def feed(username: str) -> list[dict]:
-    return [public_post(post, username) for post in read_json(POSTS_FILE, [])]
+    result = []
+    for post in read_json(POSTS_FILE, []):
+        try:
+            result.append(public_post(post, username))
+        except (FileNotFoundError, ValueError):
+            # A stale local record must not make the whole shared feed unusable.
+            continue
+    return result
 
 
 def assets(username: str) -> list[dict]:
     result = []
     for post in read_json(POSTS_FILE, []):
         if post["username"] != username: continue
-        item = public_post(post, username)
-        item["keyBase64"] = base64.b64encode((RUNTIME / post["keyFile"]).read_bytes()).decode()
-        result.append(item)
+        artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post["imageFile"], "keyFile": post["keyFile"]}]
+        for artifact in artifacts:
+            try:
+                image = image_to_data_url(read_image(RUNTIME / artifact["imageFile"]))
+                result.append({"id": artifact["id"], "postId": post["id"], "username": post["username"], "author": post["author"], "accountId": post["accountId"], "caption": post["caption"], "image": image, "createdAt": post["createdAt"], "likes": len(post.get("likedBy", [])), "liked": username in post.get("likedBy", []), "reported": post.get("reported", False), "keyBase64": base64.b64encode(read_file_bytes(RUNTIME / artifact["keyFile"])).decode()})
+            except (FileNotFoundError, ValueError):
+                continue
     return result
 
 
@@ -176,12 +251,110 @@ def toggle_like(post_id: str, username: str) -> dict:
     return {"likes": len(liked), "liked": username in liked}
 
 
-def report_post(post_id: str) -> dict:
+def add_comment(post_id: str, text: str, username: str, user: dict) -> dict:
+    content = text.strip()
+    if not content: raise ValueError("Nội dung bình luận không được để trống.")
+    if len(content) > 1000: raise ValueError("Bình luận không được vượt quá 1000 ký tự.")
+    comment = {"id": str(uuid.uuid4()), "username": username, "author": user["displayName"], "text": content, "createdAt": datetime.now(timezone.utc).isoformat()}
     with DATA_LOCK:
-        posts = read_json(POSTS_FILE, []); post = next((item for item in posts if item["id"] == post_id), None)
+        posts = read_json(POSTS_FILE, [])
+        post = next((item for item in posts if item["id"] == post_id), None)
         if not post: raise ValueError("Bài viết không tồn tại.")
-        post["reported"] = True; write_json(POSTS_FILE, posts)
-    return {"ok": True}
+        post.setdefault("comments", []).append(comment)
+        write_json(POSTS_FILE, posts)
+    return comment
+
+
+def edit_post(post_id: str, caption: str, username: str) -> dict:
+    content = caption.strip()
+    if len(content) > 5000: raise ValueError("Nội dung bài viết không được vượt quá 5000 ký tự.")
+    with DATA_LOCK:
+        posts = read_json(POSTS_FILE, [])
+        post = next((item for item in posts if item["id"] == post_id), None)
+        if not post: raise ValueError("Bài viết không tồn tại.")
+        if post.get("username") != username: raise PermissionError("Bạn chỉ có thể chỉnh sửa bài viết của mình.")
+        post["caption"] = content
+        write_json(POSTS_FILE, posts)
+    return {"id": post_id, "caption": content}
+
+
+def delete_post(post_id: str, username: str) -> dict:
+    with DATA_LOCK:
+        posts = read_json(POSTS_FILE, [])
+        post = next((item for item in posts if item["id"] == post_id), None)
+        if not post: raise ValueError("Bài viết không tồn tại.")
+        if post.get("username") != username: raise PermissionError("Bạn chỉ có thể xóa bài viết của mình.")
+        write_json(POSTS_FILE, [item for item in posts if item["id"] != post_id])
+    artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post.get("imageFile", ""), "keyFile": post.get("keyFile", "")}]
+    for artifact in artifacts:
+        for filename in (artifact.get("imageFile"), artifact.get("keyFile"), f"{artifact.get('id')}_original.jpg"):
+            if filename: unlink_file(RUNTIME / filename)
+    return {"ok": True, "deletedPostId": post_id}
+
+
+def search_accounts(query: str) -> list[dict]:
+    term = query.strip().casefold()
+    if len(term) < 2: return []
+    posts = read_json(POSTS_FILE, [])
+    counts = {}
+    for post in posts: counts[post.get("username")] = counts.get(post.get("username"), 0) + 1
+    result = []
+    for username, user in read_json(USERS_FILE, {}).items():
+        haystack = " ".join((username, user.get("displayName", ""), str(user.get("accountId", "")))).casefold()
+        if term in haystack:
+            result.append({"username": username, "displayName": user.get("displayName", username), "accountId": user.get("accountId", ""), "postCount": counts.get(username, 0)})
+    return result[:12]
+
+
+def profile(profile_username: str, viewer: str) -> dict:
+    users = read_json(USERS_FILE, {})
+    user = users.get(profile_username)
+    if not user: raise ValueError("Không tìm thấy tài khoản.")
+    profile_posts = []
+    for post in read_json(POSTS_FILE, []):
+        if post.get("username") != profile_username: continue
+        try: profile_posts.append(public_post(post, viewer))
+        except (FileNotFoundError, ValueError): continue
+    return {"username": profile_username, "displayName": user.get("displayName", profile_username), "accountId": user.get("accountId", ""), "posts": profile_posts}
+
+
+def account_identity(account_id: str) -> str:
+    for user in read_json(USERS_FILE, {}).values():
+        if str(user.get("accountId", "")) == str(account_id):
+            return user.get("displayName", "")
+    return ""
+
+
+def report_post(post_id: str, username: str, history_id: str) -> dict:
+    with DATA_LOCK:
+        posts = read_json(POSTS_FILE, [])
+        post = next((item for item in posts if item["id"] == post_id), None)
+        if not post: raise ValueError("Bài viết không tồn tại.")
+        if post.get("username") == username: raise PermissionError("Bạn không thể báo cáo bài viết của chính mình.")
+        history = read_json(HISTORY_FILE, [])
+        proof = next((item for item in history if item.get("id") == history_id and item.get("username") == username and item.get("postId") == post_id), None)
+        if not proof or not proof.get("matched"):
+            raise PermissionError("Cần xác minh watermark hợp lệ trước khi gỡ bài viết.")
+        users = read_json(USERS_FILE, {})
+        claimant = users.get(username, {})
+        claimant_name = claimant.get("displayName", "Chủ sở hữu")
+        claimant_id = claimant.get("accountId", proof.get("extractedId", ""))
+        notifications = read_json(NOTIFICATIONS_FILE, [])
+        notifications.insert(0, {
+            "id": str(uuid.uuid4()), "username": post["username"], "type": "copyright_removal",
+            "title": "Bài viết đã bị gỡ do vi phạm bản quyền",
+            "message": f"Một hình ảnh trong bài viết của bạn đã được xác minh thuộc quyền sở hữu của {claimant_name} (Account ID {claimant_id}). Bài viết đã được gỡ để bảo vệ quyền tác giả.",
+            "ownerName": claimant_name, "ownerAccountId": claimant_id,
+            "postCaption": post.get("caption", ""), "createdAt": datetime.now(timezone.utc).isoformat(), "read": False,
+        })
+        proof["action"] = "post_removed"
+        posts = [item for item in posts if item["id"] != post_id]
+        write_json(POSTS_FILE, posts); write_json(HISTORY_FILE, history); write_json(NOTIFICATIONS_FILE, notifications[:500])
+    artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post.get("imageFile", ""), "keyFile": post.get("keyFile", "")}]
+    for artifact in artifacts:
+        for filename in (artifact.get("imageFile"), artifact.get("keyFile"), f"{artifact.get('id')}_original.jpg"):
+            if filename: unlink_file(RUNTIME / filename)
+    return {"ok": True, "removedPostId": post_id}
 
 
 def verify(image_data: str, key_base64: str, owner_id: str) -> dict:
@@ -195,8 +368,64 @@ def verify(image_data: str, key_base64: str, owner_id: str) -> dict:
         extracted = bin_image_to_text(recovered, repeat_k=key["repeat_k"], payload_repeat=key["payload_repeat"], encoding=key["text_encoding"], payload_seed=key["seed"]).strip()
         expected = key["text_input"]; matched = extracted == expected == owner_id
         confidence = 100.0 if matched else round(100 * sum(a == b for a, b in zip(extracted, expected)) / max(len(expected), 1), 1)
-        return {"matched": matched, "extractedId": extracted, "expectedId": expected, "confidence": confidence}
+        return {"matched": matched, "extractedId": extracted, "expectedId": expected, "extractedOwner": account_identity(extracted), "confidence": confidence}
     finally: key_path.unlink(missing_ok=True)
+
+
+def record_verification(username: str, payload: dict, result: dict) -> dict:
+    record = {
+        "id": str(uuid.uuid4()),
+        "username": username,
+        "postId": str(payload.get("postId", "")),
+        "imageIndex": max(0, int(payload.get("imageIndex", 0))),
+        "method": "file" if payload.get("method") == "file" else "vault",
+        "sourceName": str(payload.get("sourceName", ""))[:120],
+        "matched": bool(result.get("matched")),
+        "extractedId": str(result.get("extractedId", "")),
+        "expectedId": str(result.get("expectedId", "")),
+        "extractedOwner": str(result.get("extractedOwner", "")),
+        "confidence": float(result.get("confidence", 0)),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    with DATA_LOCK:
+        history = read_json(HISTORY_FILE, [])
+        history.insert(0, record)
+        write_json(HISTORY_FILE, history[:500])
+    return record
+
+
+def notifications(username: str) -> list[dict]:
+    return [item for item in read_json(NOTIFICATIONS_FILE, []) if item.get("username") == username]
+
+
+def mark_notifications_read(username: str) -> dict:
+    with DATA_LOCK:
+        items = read_json(NOTIFICATIONS_FILE, [])
+        for item in items:
+            if item.get("username") == username: item["read"] = True
+        write_json(NOTIFICATIONS_FILE, items)
+    return {"ok": True}
+
+
+def verification_history(username: str) -> list[dict]:
+    posts = {post["id"]: post for post in read_json(POSTS_FILE, [])}
+    result = []
+    for record in read_json(HISTORY_FILE, []):
+        if record.get("username") != username:
+            continue
+        item = dict(record)
+        post = posts.get(record.get("postId"))
+        if post:
+            artifacts = post.get("artifacts") or [{"imageFile": post.get("imageFile", "")}]
+            index = min(record.get("imageIndex", 0), len(artifacts) - 1)
+            try:
+                item["image"] = image_to_data_url(read_image(RUNTIME / artifacts[index]["imageFile"]))
+                item["postAuthor"] = post.get("author", "")
+                item["caption"] = post.get("caption", "")
+            except (FileNotFoundError, ValueError):
+                item["image"] = ""
+        result.append(item)
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -209,8 +438,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             username, _, _ = current_user(self)
-            if self.path == "/api/feed": result = feed(username)
-            elif self.path == "/api/assets": result = assets(username)
+            parsed = urlparse(self.path); path = parsed.path; query = parse_qs(parsed.query)
+            if path == "/api/feed": result = feed(username)
+            elif path == "/api/assets": result = assets(username)
+            elif path == "/api/verifications": result = verification_history(username)
+            elif path == "/api/notifications": result = notifications(username)
+            elif path == "/api/accounts/search": result = search_accounts(query.get("q", [""])[0])
+            elif path == "/api/profile": result = profile(query.get("username", [username])[0], username)
             else: self.send_error(404); return
             self.send_json(result)
         except Exception as error: self.send_json({"error": str(error)}, 401 if isinstance(error, PermissionError) else 400)
@@ -222,10 +456,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 username, user, token = current_user(self)
                 if self.path == "/api/logout": result = logout(token)
-                elif self.path == "/api/posts": result = create_post(payload["image"], payload.get("caption", ""), username, user)
+                elif self.path == "/api/posts": result = create_post(payload.get("images") or payload["image"], payload.get("caption", ""), username, user)
                 elif self.path == "/api/like": result = toggle_like(payload["postId"], username)
-                elif self.path == "/api/report": result = report_post(payload["postId"])
-                elif self.path == "/api/verify": result = verify(payload["image"], payload["keyBase64"], user["accountId"])
+                elif self.path == "/api/comments": result = add_comment(payload["postId"], payload.get("text", ""), username, user)
+                elif self.path == "/api/posts/edit": result = edit_post(payload["postId"], payload.get("caption", ""), username)
+                elif self.path == "/api/posts/delete": result = delete_post(payload["postId"], username)
+                elif self.path == "/api/report": result = report_post(payload["postId"], username, payload.get("historyId", ""))
+                elif self.path == "/api/verify":
+                    result = verify(payload["image"], payload["keyBase64"], user["accountId"])
+                    record = record_verification(username, payload, result)
+                    result["historyId"] = record["id"]
+                elif self.path == "/api/notifications/read": result = mark_notifications_read(username)
                 else: self.send_error(404); return
             self.send_json(result)
         except Exception as error: self.send_json({"error": str(error)}, 401 if isinstance(error, PermissionError) else 400)

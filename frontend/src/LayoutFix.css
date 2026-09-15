@@ -1,0 +1,38 @@
+@media (min-width: 1051px) {
+  .topbar {
+    position: sticky;
+  }
+
+  .top-left {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+  }
+
+  .topbar nav {
+    position: absolute;
+    left: calc(50% - 32.5px);
+    transform: translateX(-50%);
+    margin: 0;
+    height: 50px;
+    align-self: center;
+  }
+
+  .topbar nav button {
+    height: 48px;
+    border-radius: 12px;
+  }
+
+  .topbar .top-actions {
+    position: absolute;
+    right: max(34px, calc((100vw - 1390px) / 2 + 25px));
+  }
+}
+
+@media (max-width: 1050px) {
+  .top-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+}
