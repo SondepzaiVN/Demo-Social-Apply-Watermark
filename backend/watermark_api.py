@@ -19,9 +19,23 @@ from models.watermark_pipeline import (  # noqa: E402
 
 RUNTIME = Path(__file__).resolve().parent / "runtime"
 RUNTIME.mkdir(exist_ok=True)
-USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE = (RUNTIME / name for name in ("users.json", "posts.json", "sessions.json", "verification_history.json", "notifications.json"))
+USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTRY_FILE, LICENSES_FILE = (
+    RUNTIME / name for name in (
+        "users.json", "posts.json", "sessions.json", "verification_history.json",
+        "notifications.json", "asset_registry.json", "license_requests.json",
+    )
+)
 DATA_LOCK = threading.RLock()
 FACEBOOK_MAX_SIDE, FACEBOOK_PREUPLOAD_JPEG_QUALITY = 2048, 100
+PHASH_SHORTLIST_DISTANCE = 18
+
+
+class ProvenanceConflict(Exception):
+    """Raised when an upload matches an image registered by another account."""
+
+    def __init__(self, details: dict):
+        super().__init__("Ảnh này đã được đăng ký bản quyền bởi một tài khoản khác.")
+        self.details = details
 
 
 def read_json(path: Path, default):
@@ -162,14 +176,64 @@ def resize_for_facebook(image: np.ndarray) -> np.ndarray:
     return cv2.resize(image, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
 
 
+def image_sha256(image: np.ndarray) -> str:
+    """Hash decoded pixels, so equivalent PNG/JPEG containers are treated alike."""
+    height, width = image.shape[:2]
+    digest = hashlib.sha256(f"{width}x{height}x{image.shape[2]}".encode())
+    digest.update(np.ascontiguousarray(image).tobytes())
+    return digest.hexdigest()
+
+
+def image_phash(image: np.ndarray) -> str:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    low = cv2.dct(small)[:8, :8]
+    median = float(np.median(low.flatten()[1:]))
+    bits = (low >= median).flatten()
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    return f"{value:016x}"
+
+
+def phash_distance(first: str, second: str) -> int:
+    try:
+        return (int(first, 16) ^ int(second, 16)).bit_count()
+    except (TypeError, ValueError):
+        return 64
+
+
+def sift_evidence(query: np.ndarray, candidate: np.ndarray) -> dict:
+    """Geometrically verify a pHash candidate to avoid similar-looking false matches."""
+    sift = cv2.SIFT_create(nfeatures=1800)
+    query_gray = cv2.cvtColor(query, cv2.COLOR_BGR2GRAY)
+    candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    query_kp, query_des = sift.detectAndCompute(query_gray, None)
+    candidate_kp, candidate_des = sift.detectAndCompute(candidate_gray, None)
+    if query_des is None or candidate_des is None or len(query_kp) < 8 or len(candidate_kp) < 8:
+        return {"matched": False, "matches": 0, "inliers": 0, "inlierRatio": 0.0}
+    pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(query_des, candidate_des, k=2)
+    good = [first for first, second in pairs if first.distance < 0.75 * second.distance]
+    if len(good) < 10:
+        return {"matched": False, "matches": len(good), "inliers": 0, "inlierRatio": 0.0}
+    source = np.float32([query_kp[item.queryIdx].pt for item in good]).reshape(-1, 1, 2)
+    target = np.float32([candidate_kp[item.trainIdx].pt for item in good]).reshape(-1, 1, 2)
+    _, mask = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
+    inliers = int(mask.sum()) if mask is not None else 0
+    ratio = inliers / max(len(good), 1)
+    return {
+        "matched": inliers >= 8 and ratio >= 0.35,
+        "matches": len(good), "inliers": inliers, "inlierRatio": round(ratio, 3),
+    }
+
+
 def image_to_data_url(image: np.ndarray) -> str:
     ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, FACEBOOK_PREUPLOAD_JPEG_QUALITY])
     if not ok: raise ValueError("Không thể mã hóa ảnh watermark.")
     return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
 
 
-def embed(image_data: str, account_id: str) -> dict:
-    host = resize_for_facebook(data_url_to_image(image_data))
+def embed_image(host: np.ndarray, account_id: str) -> dict:
     seed, repeat_k, payload_repeat, alpha, roi_count = 42, 3, 1, 100.0, 10
     raw = text_to_bin_image(account_id, repeat_k=repeat_k, payload_repeat=payload_repeat, encoding="utf-8", payload_seed=seed) * 255
     padded, _ = pad_watermark(raw, color=255); watermark = (padded > 127).astype(np.uint8)
@@ -186,6 +250,100 @@ def embed(image_data: str, account_id: str) -> dict:
         raise
 
 
+def registry_record(artifact: dict, owner_username: str, user: dict, source: np.ndarray | None = None) -> dict:
+    original_path = RUNTIME / f"{artifact['id']}_original.jpg"
+    marked_path = RUNTIME / artifact["imageFile"]
+    original = source if source is not None else read_image(original_path)
+    marked = read_image(marked_path)
+    return {
+        "id": artifact["id"], "ownerUsername": owner_username,
+        "ownerDisplayName": user.get("displayName", owner_username),
+        "ownerAccountId": str(user.get("accountId", "")),
+        "imageFile": artifact["imageFile"], "keyFile": artifact["keyFile"],
+        "originalFile": original_path.name,
+        "sourceSha256": image_sha256(original), "watermarkedSha256": image_sha256(marked),
+        "sourcePHash": image_phash(original), "watermarkedPHash": image_phash(marked),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def ensure_asset_registry() -> list[dict]:
+    """Migrate artifacts made before provenance tracking without changing their keys."""
+    with DATA_LOCK:
+        registry = read_json(REGISTRY_FILE, [])
+        known = {item.get("id") for item in registry}
+        changed = False
+        users = read_json(USERS_FILE, {})
+        for post in read_json(POSTS_FILE, []):
+            artifacts = post.get("artifacts") or [{
+                "id": post["id"], "imageFile": post.get("imageFile", ""),
+                "keyFile": post.get("keyFile", ""),
+            }]
+            for artifact in artifacts:
+                if not artifact.get("id") or artifact["id"] in known:
+                    continue
+                try:
+                    owner = users.get(post.get("username", ""), {
+                        "displayName": post.get("author", ""), "accountId": post.get("accountId", ""),
+                    })
+                    registry.append(registry_record(artifact, post.get("username", ""), owner))
+                    known.add(artifact["id"]); changed = True
+                except (FileNotFoundError, ValueError, OSError):
+                    continue
+        if changed or not REGISTRY_FILE.exists():
+            write_json(REGISTRY_FILE, registry)
+        return registry
+
+
+def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
+    query_sha, query_phash = image_sha256(image), image_phash(image)
+    for item in registry:
+        if query_sha in {item.get("sourceSha256"), item.get("watermarkedSha256")}:
+            return {**item, "matchMethod": "sha256", "pHashDistance": 0,
+                    "siftMatches": 0, "siftInliers": 0}
+
+    candidates = []
+    for item in registry:
+        distance = min(
+            phash_distance(query_phash, item.get("sourcePHash", "")),
+            phash_distance(query_phash, item.get("watermarkedPHash", "")),
+        )
+        if distance <= PHASH_SHORTLIST_DISTANCE:
+            candidates.append((distance, item))
+    for distance, item in sorted(candidates, key=lambda pair: pair[0])[:20]:
+        best = None
+        for filename in (item.get("imageFile"), item.get("originalFile")):
+            if not filename:
+                continue
+            try:
+                evidence = sift_evidence(image, read_image(RUNTIME / filename))
+            except (FileNotFoundError, ValueError):
+                continue
+            if best is None or evidence["inliers"] > best["inliers"]:
+                best = evidence
+            if evidence["matched"]:
+                return {
+                    **item, "matchMethod": "phash+sift", "pHashDistance": distance,
+                    "siftMatches": evidence["matches"], "siftInliers": evidence["inliers"],
+                }
+        # Very close pHash is accepted only when both images lack enough SIFT evidence.
+        if distance <= 2 and best and best["matches"] == 0:
+            return {**item, "matchMethod": "phash", "pHashDistance": distance,
+                    "siftMatches": 0, "siftInliers": 0}
+    return None
+
+
+def artifact_from_registry(item: dict) -> dict:
+    return {"id": item["id"], "imageFile": item["imageFile"], "keyFile": item["keyFile"]}
+
+
+def approved_license(asset_id: str, requester_username: str) -> dict | None:
+    return next((item for item in read_json(LICENSES_FILE, []) if
+                 item.get("assetId") == asset_id and
+                 item.get("requesterUsername") == requester_username and
+                 item.get("status") == "approved"), None)
+
+
 def public_post(post: dict, viewer: str = "") -> dict:
     artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post["imageFile"], "keyFile": post["keyFile"]}]
     images = [image_to_data_url(read_image(RUNTIME / artifact["imageFile"])) for artifact in artifacts]
@@ -197,18 +355,63 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
     image_items = image_data if isinstance(image_data, list) else [image_data]
     if not image_items or len(image_items) > 10:
         raise ValueError("Mỗi bài viết cần từ 1 đến 10 ảnh.")
-    artifacts = []
+    hosts = [resize_for_facebook(data_url_to_image(item)) for item in image_items]
+    artifacts, created_artifacts, new_records = [], [], []
+    reused_count = licensed_count = 0
     try:
-        for item in image_items:
-            artifacts.append(embed(item, user["accountId"]))
-        post = {"id": str(uuid.uuid4()), "username": username, "author": user["displayName"], "accountId": user["accountId"], "caption": caption.strip(), "artifacts": artifacts, "createdAt": datetime.now(timezone.utc).isoformat(), "likedBy": [], "comments": [], "reported": False}
-        # Confirm every generated image can be read before publishing metadata.
-        result = public_post(post, username)
         with DATA_LOCK:
-            posts = read_json(POSTS_FILE, []); posts.insert(0, post); write_json(POSTS_FILE, posts)
+            registry = ensure_asset_registry()
+            for index, host in enumerate(hosts):
+                matched = registered_match(host, registry)
+                license_record = approved_license(matched.get("id", ""), username) if matched else None
+                if matched and matched.get("ownerUsername") != username and not license_record:
+                    raise ProvenanceConflict({
+                        "imageIndex": index, "assetId": matched.get("id", ""),
+                        "ownerUsername": matched.get("ownerUsername", ""),
+                        "ownerDisplayName": matched.get("ownerDisplayName", ""),
+                        "ownerAccountId": matched.get("ownerAccountId", ""),
+                        "registeredAt": matched.get("createdAt", ""),
+                        "matchMethod": matched.get("matchMethod", ""),
+                        "pHashDistance": matched.get("pHashDistance"),
+                        "siftMatches": matched.get("siftMatches"),
+                        "siftInliers": matched.get("siftInliers"),
+                    })
+                if matched:
+                    artifacts.append(artifact_from_registry(matched))
+                    if matched.get("ownerUsername") == username:
+                        reused_count += 1
+                    else:
+                        licensed_count += 1
+                    continue
+                artifact = embed_image(host, user["accountId"])
+                record = registry_record(artifact, username, user, host)
+                artifacts.append(artifact); created_artifacts.append(artifact)
+                new_records.append(record); registry.append(record)
+
+            provenance = {
+                "status": "licensed" if licensed_count else "reused" if reused_count else "new",
+                "reusedCount": reused_count, "licensedCount": licensed_count,
+                "newCount": len(new_records),
+            }
+            licenses = []
+            for artifact in artifacts:
+                permission = approved_license(artifact["id"], username)
+                if permission:
+                    licenses.append({
+                        "requestId": permission["id"], "assetId": artifact["id"],
+                        "ownerUsername": permission["ownerUsername"],
+                        "ownerDisplayName": permission["ownerDisplayName"],
+                        "ownerAccountId": permission["ownerAccountId"],
+                        "approvedAt": permission.get("respondedAt", ""),
+                    })
+            post = {"id": str(uuid.uuid4()), "username": username, "author": user["displayName"], "accountId": user["accountId"], "caption": caption.strip(), "artifacts": artifacts, "provenance": provenance, "licenses": licenses, "createdAt": datetime.now(timezone.utc).isoformat(), "likedBy": [], "comments": [], "reported": False}
+            # Confirm every generated/reused image can be read before publishing metadata.
+            result = public_post(post, username)
+            posts = read_json(POSTS_FILE, []); posts.insert(0, post)
+            write_json(REGISTRY_FILE, registry); write_json(POSTS_FILE, posts)
         return result
     except Exception:
-        for artifact in artifacts:
+        for artifact in created_artifacts:
             for field in ("imageFile", "keyFile"):
                 unlink_file(RUNTIME / artifact[field])
             unlink_file(RUNTIME / f"{artifact['id']}_original.jpg")
@@ -228,15 +431,24 @@ def feed(username: str) -> list[dict]:
 
 def assets(username: str) -> list[dict]:
     result = []
-    for post in read_json(POSTS_FILE, []):
-        if post["username"] != username: continue
-        artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post["imageFile"], "keyFile": post["keyFile"]}]
-        for artifact in artifacts:
-            try:
-                image = image_to_data_url(read_image(RUNTIME / artifact["imageFile"]))
-                result.append({"id": artifact["id"], "postId": post["id"], "username": post["username"], "author": post["author"], "accountId": post["accountId"], "caption": post["caption"], "image": image, "createdAt": post["createdAt"], "likes": len(post.get("likedBy", [])), "liked": username in post.get("likedBy", []), "reported": post.get("reported", False), "keyBase64": base64.b64encode(read_file_bytes(RUNTIME / artifact["keyFile"])).decode()})
-            except (FileNotFoundError, ValueError):
-                continue
+    posts = read_json(POSTS_FILE, [])
+    for item in ensure_asset_registry():
+        if item.get("ownerUsername") != username:
+            continue
+        post = next((candidate for candidate in posts if any(
+            artifact.get("id") == item.get("id") for artifact in candidate.get("artifacts", [])
+        )), {})
+        try:
+            result.append({
+                "id": item["id"], "postId": post.get("id", ""), "username": username,
+                "author": item.get("ownerDisplayName", ""), "accountId": item.get("ownerAccountId", ""),
+                "caption": "", "image": image_to_data_url(read_image(RUNTIME / item["imageFile"])),
+                "createdAt": item.get("createdAt", ""), "likes": 0, "liked": False,
+                "reported": False,
+                "keyBase64": base64.b64encode(read_file_bytes(RUNTIME / item["keyFile"])).decode(),
+            })
+        except (FileNotFoundError, ValueError):
+            continue
     return result
 
 
@@ -278,17 +490,42 @@ def edit_post(post_id: str, caption: str, username: str) -> dict:
     return {"id": post_id, "caption": content}
 
 
+def release_unreferenced_assets(removed_post: dict, remaining_posts: list[dict]) -> None:
+    """Only remove shared artifact files after their final post reference disappears."""
+    removed = removed_post.get("artifacts") or [{
+        "id": removed_post["id"], "imageFile": removed_post.get("imageFile", ""),
+        "keyFile": removed_post.get("keyFile", ""),
+    }]
+    referenced = {
+        artifact.get("id")
+        for post in remaining_posts
+        for artifact in (post.get("artifacts") or [{"id": post.get("id")}])
+    }
+    releasable = {artifact.get("id") for artifact in removed if artifact.get("id") not in referenced}
+    registry = ensure_asset_registry()
+    by_id = {item.get("id"): item for item in registry}
+    for artifact_id in releasable:
+        item = by_id.get(artifact_id, {})
+        fallback = next((artifact for artifact in removed if artifact.get("id") == artifact_id), {})
+        for filename in (
+            item.get("imageFile") or fallback.get("imageFile"),
+            item.get("keyFile") or fallback.get("keyFile"),
+            item.get("originalFile") or f"{artifact_id}_original.jpg",
+        ):
+            if filename:
+                unlink_file(RUNTIME / filename)
+    write_json(REGISTRY_FILE, [item for item in registry if item.get("id") not in releasable])
+
+
 def delete_post(post_id: str, username: str) -> dict:
     with DATA_LOCK:
         posts = read_json(POSTS_FILE, [])
         post = next((item for item in posts if item["id"] == post_id), None)
         if not post: raise ValueError("Bài viết không tồn tại.")
         if post.get("username") != username: raise PermissionError("Bạn chỉ có thể xóa bài viết của mình.")
-        write_json(POSTS_FILE, [item for item in posts if item["id"] != post_id])
-    artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post.get("imageFile", ""), "keyFile": post.get("keyFile", "")}]
-    for artifact in artifacts:
-        for filename in (artifact.get("imageFile"), artifact.get("keyFile"), f"{artifact.get('id')}_original.jpg"):
-            if filename: unlink_file(RUNTIME / filename)
+        remaining = [item for item in posts if item["id"] != post_id]
+        write_json(POSTS_FILE, remaining)
+        release_unreferenced_assets(post, remaining)
     return {"ok": True, "deletedPostId": post_id}
 
 
@@ -335,6 +572,14 @@ def report_post(post_id: str, username: str, history_id: str) -> dict:
         proof = next((item for item in history if item.get("id") == history_id and item.get("username") == username and item.get("postId") == post_id), None)
         if not proof or not proof.get("matched"):
             raise PermissionError("Cần xác minh watermark hợp lệ trước khi gỡ bài viết.")
+        artifacts = post.get("artifacts", [])
+        image_index = min(max(0, int(proof.get("imageIndex", 0))), max(0, len(artifacts) - 1))
+        asset_id = artifacts[image_index].get("id", "") if artifacts else ""
+        permission = next((item for item in post.get("licenses", []) if
+                           item.get("assetId") == asset_id and
+                           item.get("ownerUsername") == username), None)
+        if permission:
+            raise PermissionError("Bạn đã cấp quyền sử dụng ảnh này cho người đăng nên bài viết không vi phạm bản quyền.")
         users = read_json(USERS_FILE, {})
         claimant = users.get(username, {})
         claimant_name = claimant.get("displayName", "Chủ sở hữu")
@@ -350,10 +595,7 @@ def report_post(post_id: str, username: str, history_id: str) -> dict:
         proof["action"] = "post_removed"
         posts = [item for item in posts if item["id"] != post_id]
         write_json(POSTS_FILE, posts); write_json(HISTORY_FILE, history); write_json(NOTIFICATIONS_FILE, notifications[:500])
-    artifacts = post.get("artifacts") or [{"id": post["id"], "imageFile": post.get("imageFile", ""), "keyFile": post.get("keyFile", "")}]
-    for artifact in artifacts:
-        for filename in (artifact.get("imageFile"), artifact.get("keyFile"), f"{artifact.get('id')}_original.jpg"):
-            if filename: unlink_file(RUNTIME / filename)
+        release_unreferenced_assets(post, posts)
     return {"ok": True, "removedPostId": post_id}
 
 
@@ -396,6 +638,80 @@ def record_verification(username: str, payload: dict, result: dict) -> dict:
 
 def notifications(username: str) -> list[dict]:
     return [item for item in read_json(NOTIFICATIONS_FILE, []) if item.get("username") == username]
+
+
+def request_image_license(asset_id: str, username: str, user: dict) -> dict:
+    with DATA_LOCK:
+        registry = ensure_asset_registry()
+        asset = next((item for item in registry if item.get("id") == asset_id), None)
+        if not asset:
+            raise ValueError("Ảnh bản quyền này không còn tồn tại.")
+        if asset.get("ownerUsername") == username:
+            raise ValueError("Bạn đã là chủ sở hữu của ảnh này.")
+        requests = read_json(LICENSES_FILE, [])
+        existing = next((item for item in requests if
+                         item.get("assetId") == asset_id and
+                         item.get("requesterUsername") == username and
+                         item.get("status") in {"pending", "approved"}), None)
+        if existing:
+            return {**existing, "alreadyExists": True}
+        now = datetime.now(timezone.utc).isoformat()
+        record = {
+            "id": str(uuid.uuid4()), "assetId": asset_id, "status": "pending",
+            "ownerUsername": asset.get("ownerUsername", ""),
+            "ownerDisplayName": asset.get("ownerDisplayName", ""),
+            "ownerAccountId": asset.get("ownerAccountId", ""),
+            "requesterUsername": username, "requesterDisplayName": user.get("displayName", username),
+            "requesterAccountId": str(user.get("accountId", "")), "createdAt": now,
+        }
+        requests.insert(0, record)
+        alerts = read_json(NOTIFICATIONS_FILE, [])
+        alerts.insert(0, {
+            "id": str(uuid.uuid4()), "username": record["ownerUsername"],
+            "type": "license_request", "requestId": record["id"], "requestStatus": "pending",
+            "title": "Yêu cầu sử dụng ảnh bản quyền",
+            "message": f"{record['requesterDisplayName']} (Account ID {record['requesterAccountId']}) muốn đăng lại một ảnh thuộc kho bản quyền của bạn.",
+            "requesterName": record["requesterDisplayName"],
+            "requesterAccountId": record["requesterAccountId"],
+            "createdAt": now, "read": False,
+        })
+        write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts[:500])
+        return record
+
+
+def respond_image_license(request_id: str, decision: str, username: str) -> dict:
+    if decision not in {"approved", "denied"}:
+        raise ValueError("Phản hồi yêu cầu không hợp lệ.")
+    with DATA_LOCK:
+        requests = read_json(LICENSES_FILE, [])
+        record = next((item for item in requests if item.get("id") == request_id), None)
+        if not record:
+            raise ValueError("Yêu cầu sử dụng ảnh không tồn tại.")
+        if record.get("ownerUsername") != username:
+            raise PermissionError("Chỉ chủ sở hữu ảnh mới có thể phản hồi yêu cầu này.")
+        if record.get("status") != "pending":
+            return {"id": request_id, "status": record.get("status")}
+        now = datetime.now(timezone.utc).isoformat()
+        record["status"] = decision; record["respondedAt"] = now
+        alerts = read_json(NOTIFICATIONS_FILE, [])
+        for alert in alerts:
+            if alert.get("requestId") == request_id and alert.get("username") == username:
+                alert["requestStatus"] = decision; alert["read"] = True
+        approved = decision == "approved"
+        alerts.insert(0, {
+            "id": str(uuid.uuid4()), "username": record["requesterUsername"],
+            "type": "license_response", "requestId": request_id, "requestStatus": decision,
+            "title": "Yêu cầu sử dụng ảnh đã được chấp thuận" if approved else "Yêu cầu sử dụng ảnh bị từ chối",
+            "message": (
+                f"{record['ownerDisplayName']} đã cho phép bạn đăng lại ảnh. Khi tải ảnh lên, hệ thống sẽ dùng watermark gốc và ghi rõ nguồn."
+                if approved else
+                f"{record['ownerDisplayName']} chưa đồng ý cho bạn sử dụng ảnh này. Bạn không thể đăng lại ảnh."
+            ),
+            "ownerName": record["ownerDisplayName"], "ownerAccountId": record["ownerAccountId"],
+            "createdAt": now, "read": False,
+        })
+        write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts[:500])
+        return {"id": request_id, "status": decision}
 
 
 def mark_notifications_read(username: str) -> dict:
@@ -447,7 +763,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/profile": result = profile(query.get("username", [username])[0], username)
             else: self.send_error(404); return
             self.send_json(result)
-        except Exception as error: self.send_json({"error": str(error)}, 401 if isinstance(error, PermissionError) else 400)
+        except Exception as error:
+            status = 401 if isinstance(error, PermissionError) else 409 if isinstance(error, ProvenanceConflict) else 400
+            body = {"error": str(error)}
+            if isinstance(error, ProvenanceConflict):
+                body.update({"code": "PROVENANCE_CONFLICT", "details": error.details})
+            self.send_json(body, status)
     def do_POST(self):
         try:
             payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
@@ -462,6 +783,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/api/posts/edit": result = edit_post(payload["postId"], payload.get("caption", ""), username)
                 elif self.path == "/api/posts/delete": result = delete_post(payload["postId"], username)
                 elif self.path == "/api/report": result = report_post(payload["postId"], username, payload.get("historyId", ""))
+                elif self.path == "/api/licenses/request": result = request_image_license(payload["assetId"], username, user)
+                elif self.path == "/api/licenses/respond": result = respond_image_license(payload["requestId"], payload["decision"], username)
                 elif self.path == "/api/verify":
                     result = verify(payload["image"], payload["keyBase64"], user["accountId"])
                     record = record_verification(username, payload, result)
@@ -469,7 +792,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/api/notifications/read": result = mark_notifications_read(username)
                 else: self.send_error(404); return
             self.send_json(result)
-        except Exception as error: self.send_json({"error": str(error)}, 401 if isinstance(error, PermissionError) else 400)
+        except Exception as error:
+            status = 401 if isinstance(error, PermissionError) else 409 if isinstance(error, ProvenanceConflict) else 400
+            body = {"error": str(error)}
+            if isinstance(error, ProvenanceConflict):
+                body.update({"code": "PROVENANCE_CONFLICT", "details": error.details})
+            self.send_json(body, status)
 
 
 if __name__ == "__main__":
