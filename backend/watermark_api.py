@@ -337,11 +337,20 @@ def artifact_from_registry(item: dict) -> dict:
     return {"id": item["id"], "imageFile": item["imageFile"], "keyFile": item["keyFile"]}
 
 
-def approved_license(asset_id: str, requester_username: str) -> dict | None:
+def draft_fingerprint(caption: str, images: list[np.ndarray]) -> str:
+    snapshot = {"caption": caption.strip(), "images": [image_sha256(image) for image in images]}
+    encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def approved_license(asset_id: str, requester_username: str, draft_hash: str, request_id: str) -> dict | None:
     return next((item for item in read_json(LICENSES_FILE, []) if
                  item.get("assetId") == asset_id and
                  item.get("requesterUsername") == requester_username and
-                 item.get("status") == "approved"), None)
+                 item.get("status") == "approved" and
+                 not item.get("consumedAt") and
+                 item.get("draftHash") == draft_hash and
+                 item.get("id") == request_id), None)
 
 
 def public_post(post: dict, viewer: str = "") -> dict:
@@ -351,19 +360,23 @@ def public_post(post: dict, viewer: str = "") -> dict:
     return {**public, "image": images[0], "images": images, "comments": post.get("comments", []), "likes": len(post.get("likedBy", [])), "liked": viewer in post.get("likedBy", [])}
 
 
-def create_post(image_data: str | list[str], caption: str, username: str, user: dict) -> dict:
+def create_post(image_data: str | list[str], caption: str, username: str, user: dict, license_request_id: str = "") -> dict:
     image_items = image_data if isinstance(image_data, list) else [image_data]
     if not image_items or len(image_items) > 10:
         raise ValueError("Mỗi bài viết cần từ 1 đến 10 ảnh.")
     hosts = [resize_for_facebook(data_url_to_image(item)) for item in image_items]
+    current_draft_hash = draft_fingerprint(caption, hosts)
     artifacts, created_artifacts, new_records = [], [], []
+    used_permissions = []
     reused_count = licensed_count = 0
     try:
         with DATA_LOCK:
             registry = ensure_asset_registry()
             for index, host in enumerate(hosts):
                 matched = registered_match(host, registry)
-                license_record = approved_license(matched.get("id", ""), username) if matched else None
+                license_record = approved_license(
+                    matched.get("id", ""), username, current_draft_hash, license_request_id
+                ) if matched else None
                 if matched and matched.get("ownerUsername") != username and not license_record:
                     raise ProvenanceConflict({
                         "imageIndex": index, "assetId": matched.get("id", ""),
@@ -381,7 +394,7 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                     if matched.get("ownerUsername") == username:
                         reused_count += 1
                     else:
-                        licensed_count += 1
+                        licensed_count += 1; used_permissions.append(license_record)
                     continue
                 artifact = embed_image(host, user["accountId"])
                 record = registry_record(artifact, username, user, host)
@@ -393,17 +406,14 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                 "reusedCount": reused_count, "licensedCount": licensed_count,
                 "newCount": len(new_records),
             }
-            licenses = []
-            for artifact in artifacts:
-                permission = approved_license(artifact["id"], username)
-                if permission:
-                    licenses.append({
-                        "requestId": permission["id"], "assetId": artifact["id"],
-                        "ownerUsername": permission["ownerUsername"],
-                        "ownerDisplayName": permission["ownerDisplayName"],
-                        "ownerAccountId": permission["ownerAccountId"],
-                        "approvedAt": permission.get("respondedAt", ""),
-                    })
+            licenses = [{
+                "requestId": permission["id"], "assetId": permission["assetId"],
+                "ownerUsername": permission["ownerUsername"],
+                "ownerDisplayName": permission["ownerDisplayName"],
+                "ownerAccountId": permission["ownerAccountId"],
+                "approvedAt": permission.get("respondedAt", ""),
+                "draftHash": permission.get("draftHash", ""),
+            } for permission in used_permissions if permission]
             post = {"id": str(uuid.uuid4()), "username": username, "author": user["displayName"], "accountId": user["accountId"], "caption": caption.strip(), "artifacts": artifacts, "provenance": provenance, "licenses": licenses, "createdAt": datetime.now(timezone.utc).isoformat(), "likedBy": [], "comments": [], "reported": False}
             # Confirm every generated/reused image can be read before publishing metadata.
             result = public_post(post, username)
@@ -485,6 +495,8 @@ def edit_post(post_id: str, caption: str, username: str) -> dict:
         post = next((item for item in posts if item["id"] == post_id), None)
         if not post: raise ValueError("Bài viết không tồn tại.")
         if post.get("username") != username: raise PermissionError("Bạn chỉ có thể chỉnh sửa bài viết của mình.")
+        if post.get("licenses"):
+            raise PermissionError("Bài viết được cấp quyền phải giữ nguyên nội dung đã được chủ sở hữu duyệt.")
         post["caption"] = content
         write_json(POSTS_FILE, posts)
     return {"id": post_id, "caption": content}
@@ -637,10 +649,58 @@ def record_verification(username: str, payload: dict, result: dict) -> dict:
 
 
 def notifications(username: str) -> list[dict]:
-    return [item for item in read_json(NOTIFICATIONS_FILE, []) if item.get("username") == username]
+    requests = {item.get("id"): item for item in read_json(LICENSES_FILE, [])}
+    result = []
+    for source in read_json(NOTIFICATIONS_FILE, []):
+        if source.get("username") != username:
+            continue
+        item = dict(source)
+        request = requests.get(item.get("requestId"))
+        if request:
+            item["draftCaption"] = request.get("draftCaption", "")
+            item["draftImages"] = request.get("draftImages", [])
+            item["licensedImageIndex"] = request.get("imageIndex", 0)
+            item["requestStatus"] = "published" if request.get("consumedAt") else request.get("status", item.get("requestStatus"))
+        result.append(item)
+    return result
 
 
-def request_image_license(asset_id: str, username: str, user: dict) -> dict:
+def license_center(username: str) -> dict:
+    def public_request(source: dict) -> dict:
+        status = "published" if source.get("consumedAt") else source.get("status", "pending")
+        return {
+            "id": source.get("id", ""), "assetId": source.get("assetId", ""),
+            "status": status, "ownerUsername": source.get("ownerUsername", ""),
+            "ownerDisplayName": source.get("ownerDisplayName", ""),
+            "ownerAccountId": source.get("ownerAccountId", ""),
+            "requesterUsername": source.get("requesterUsername", ""),
+            "requesterDisplayName": source.get("requesterDisplayName", ""),
+            "requesterAccountId": source.get("requesterAccountId", ""),
+            "draftCaption": source.get("draftCaption", ""),
+            "draftImages": source.get("draftImages", []),
+            "imageIndex": source.get("imageIndex", 0),
+            "createdAt": source.get("createdAt", ""),
+            "respondedAt": source.get("respondedAt", ""),
+            "postId": source.get("postId", ""),
+        }
+
+    requests = read_json(LICENSES_FILE, [])
+    return {
+        "incoming": [public_request(item) for item in requests if item.get("ownerUsername") == username],
+        "outgoing": [public_request(item) for item in requests if item.get("requesterUsername") == username],
+    }
+
+
+def request_image_license(asset_id: str, payload: dict, username: str, user: dict) -> dict:
+    image_items = payload.get("images") or []
+    if not isinstance(image_items, list) or not image_items or len(image_items) > 10:
+        raise ValueError("Bản nháp xin quyền cần từ 1 đến 10 ảnh.")
+    caption = str(payload.get("caption", "")).strip()
+    if len(caption) > 5000:
+        raise ValueError("Nội dung bài viết không được vượt quá 5000 ký tự.")
+    image_index = max(0, min(int(payload.get("imageIndex", 0)), len(image_items) - 1))
+    hosts = [resize_for_facebook(data_url_to_image(item)) for item in image_items]
+    draft_hash = draft_fingerprint(caption, hosts)
     with DATA_LOCK:
         registry = ensure_asset_registry()
         asset = next((item for item in registry if item.get("id") == asset_id), None)
@@ -648,10 +708,14 @@ def request_image_license(asset_id: str, username: str, user: dict) -> dict:
             raise ValueError("Ảnh bản quyền này không còn tồn tại.")
         if asset.get("ownerUsername") == username:
             raise ValueError("Bạn đã là chủ sở hữu của ảnh này.")
+        matched = registered_match(hosts[image_index], registry)
+        if not matched or matched.get("id") != asset_id:
+            raise ValueError("Ảnh trong bản nháp không còn khớp với tài sản bản quyền đã phát hiện.")
         requests = read_json(LICENSES_FILE, [])
         existing = next((item for item in requests if
                          item.get("assetId") == asset_id and
                          item.get("requesterUsername") == username and
+                         item.get("draftHash") == draft_hash and
                          item.get("status") in {"pending", "approved"}), None)
         if existing:
             return {**existing, "alreadyExists": True}
@@ -662,7 +726,10 @@ def request_image_license(asset_id: str, username: str, user: dict) -> dict:
             "ownerDisplayName": asset.get("ownerDisplayName", ""),
             "ownerAccountId": asset.get("ownerAccountId", ""),
             "requesterUsername": username, "requesterDisplayName": user.get("displayName", username),
-            "requesterAccountId": str(user.get("accountId", "")), "createdAt": now,
+            "requesterAccountId": str(user.get("accountId", "")),
+            "draftCaption": caption, "draftImages": image_items,
+            "draftImageHashes": [image_sha256(image) for image in hosts],
+            "draftHash": draft_hash, "imageIndex": image_index, "createdAt": now,
         }
         requests.insert(0, record)
         alerts = read_json(NOTIFICATIONS_FILE, [])
@@ -703,7 +770,7 @@ def respond_image_license(request_id: str, decision: str, username: str) -> dict
             "type": "license_response", "requestId": request_id, "requestStatus": decision,
             "title": "Yêu cầu sử dụng ảnh đã được chấp thuận" if approved else "Yêu cầu sử dụng ảnh bị từ chối",
             "message": (
-                f"{record['ownerDisplayName']} đã cho phép bạn đăng lại ảnh. Khi tải ảnh lên, hệ thống sẽ dùng watermark gốc và ghi rõ nguồn."
+                f"{record['ownerDisplayName']} đã duyệt bản nháp. Bạn có thể đăng chính xác bài viết đã được duyệt bằng nút bên dưới."
                 if approved else
                 f"{record['ownerDisplayName']} chưa đồng ý cho bạn sử dụng ảnh này. Bạn không thể đăng lại ảnh."
             ),
@@ -712,6 +779,35 @@ def respond_image_license(request_id: str, decision: str, username: str) -> dict
         })
         write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts[:500])
         return {"id": request_id, "status": decision}
+
+
+def publish_approved_license(request_id: str, username: str, user: dict) -> dict:
+    with DATA_LOCK:
+        requests = read_json(LICENSES_FILE, [])
+        record = next((item for item in requests if item.get("id") == request_id), None)
+        if not record:
+            raise ValueError("Yêu cầu sử dụng ảnh không tồn tại.")
+        if record.get("requesterUsername") != username:
+            raise PermissionError("Chỉ người gửi yêu cầu mới có thể đăng bản nháp này.")
+        if record.get("status") != "approved":
+            raise PermissionError("Bản nháp chưa được chủ sở hữu chấp thuận.")
+        if record.get("consumedAt"):
+            raise ValueError("Bản nháp được cấp quyền này đã được đăng trước đó.")
+        post = create_post(
+            record.get("draftImages", []), record.get("draftCaption", ""),
+            username, user, license_request_id=request_id,
+        )
+        # Re-read because create_post also acquires the shared lock and writes post metadata.
+        requests = read_json(LICENSES_FILE, [])
+        record = next(item for item in requests if item.get("id") == request_id)
+        record["consumedAt"] = datetime.now(timezone.utc).isoformat()
+        record["postId"] = post["id"]
+        alerts = read_json(NOTIFICATIONS_FILE, [])
+        for alert in alerts:
+            if alert.get("requestId") == request_id:
+                alert["requestStatus"] = "published"
+        write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts)
+        return post
 
 
 def mark_notifications_read(username: str) -> dict:
@@ -759,6 +855,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/assets": result = assets(username)
             elif path == "/api/verifications": result = verification_history(username)
             elif path == "/api/notifications": result = notifications(username)
+            elif path == "/api/licenses": result = license_center(username)
             elif path == "/api/accounts/search": result = search_accounts(query.get("q", [""])[0])
             elif path == "/api/profile": result = profile(query.get("username", [username])[0], username)
             else: self.send_error(404); return
@@ -783,8 +880,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/api/posts/edit": result = edit_post(payload["postId"], payload.get("caption", ""), username)
                 elif self.path == "/api/posts/delete": result = delete_post(payload["postId"], username)
                 elif self.path == "/api/report": result = report_post(payload["postId"], username, payload.get("historyId", ""))
-                elif self.path == "/api/licenses/request": result = request_image_license(payload["assetId"], username, user)
+                elif self.path == "/api/licenses/request": result = request_image_license(payload["assetId"], payload, username, user)
                 elif self.path == "/api/licenses/respond": result = respond_image_license(payload["requestId"], payload["decision"], username)
+                elif self.path == "/api/licenses/publish": result = publish_approved_license(payload["requestId"], username, user)
                 elif self.path == "/api/verify":
                     result = verify(payload["image"], payload["keyBase64"], user["accountId"])
                     record = record_verification(username, payload, result)

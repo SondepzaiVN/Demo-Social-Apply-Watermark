@@ -20,14 +20,20 @@ người đăng đã được bảo vệ, hay ảnh đã được một tài kho
 
 ## Quy trình cấp quyền đăng lại
 
-1. Người muốn đăng lại gửi yêu cầu từ hộp cảnh báo nguồn gốc.
-2. Chủ sở hữu nhận thông báo và chọn **Cho phép** hoặc **Từ chối**.
-3. Khi được phép, người yêu cầu tải ảnh lên lại; hệ thống dùng asset, watermark và key gốc,
-   không nhúng Account ID của người đăng lại.
-4. Bài viết hiển thị tên và Account ID của chủ sở hữu gốc.
-5. Trình xử lý report kiểm tra giấy phép để không tự động gỡ một bài đã được cấp quyền.
+1. Người muốn đăng lại gửi toàn bộ bản nháp gồm caption và danh sách ảnh từ hộp cảnh báo.
+2. Chủ sở hữu nhận thông báo, xem trước bài viết hoàn chỉnh và chọn **Cho phép đăng** hoặc
+   **Từ chối**.
+3. Hệ thống tạo SHA-256 cho caption cùng pixel của từng ảnh. Giấy phép chỉ hợp lệ với đúng
+   snapshot đã trình duyệt.
+4. Khi được phép, người yêu cầu dùng nút **Đăng bài đã duyệt**; backend đăng trực tiếp snapshot,
+   dùng asset, watermark và key gốc, không nhúng Account ID của người đăng lại.
+5. Mỗi giấy phép chỉ dùng được một lần. Bài đã cấp quyền không được sửa caption hoặc thay ảnh.
+6. Bài viết hiển thị tên và Account ID của chủ sở hữu gốc.
+7. Trình xử lý report kiểm tra giấy phép để không tự động gỡ một bài đã được cấp quyền.
 
 Yêu cầu và trạng thái cấp quyền được lưu tại `backend/runtime/license_requests.json`.
+Trang cá nhân của mỗi tài khoản tổng hợp riêng hai danh sách **Các bài viết cần duyệt** và
+**Đã gửi yêu cầu duyệt**, kèm preview và hành động phù hợp với vai trò hiện tại.
 
 Registry cục bộ nằm tại `backend/runtime/asset_registry.json`. Mỗi asset giữ dấu vân tay
 của cả ảnh nguồn và ảnh watermark, chủ sở hữu, file ảnh và file key.
