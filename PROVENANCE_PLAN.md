@@ -12,11 +12,22 @@ người đăng đã được bảo vệ, hay ảnh đã được một tài kho
 3. Tính pHash và chỉ lấy tối đa 20 ứng viên gần nhất.
 4. Dùng SIFT + RANSAC để xác minh hình học trên các ứng viên, tránh kết luận nhầm chỉ vì
    hai ảnh có bố cục hoặc màu sắc giống nhau.
-5. Xử lý kết quả:
+5. Xếp hạng các ảnh đã vượt qua SIFT + RANSAC theo số inlier và khoảng cách pHash.
+6. Với tối đa 3 ứng viên hình học tốt nhất, lần lượt nạp file key `.npz` của chính ứng viên đó,
+   trích xuất watermark từ ảnh tải lên và đối chiếu ID đọc được với Account ID trong registry.
+   Dừng ngay khi tìm được một ID hợp lệ trùng khớp.
+7. Xử lý kết quả:
    - Ảnh mới: nhúng Account ID, tạo key và đăng ký asset.
    - Ảnh đã thuộc chính tài khoản: dùng lại ảnh watermark và key cũ, không nhúng lần hai.
    - Ảnh thuộc tài khoản khác: chặn đăng trước khi nhúng, hiển thị chủ sở hữu và Account ID;
      người đăng có thể gửi yêu cầu sử dụng.
+
+Nếu SIFT + RANSAC xác nhận ảnh cùng nguồn nhưng watermark đã bị crop/nén/resize quá mạnh nên
+không đọc lại được ID, hệ thống vẫn xem đây là ảnh liên quan thay vì ảnh mới. Giao diện phải ghi
+rõ trạng thái **không khôi phục được ID**, không được giả vờ rằng bước trích xuất đã thành công.
+
+Ảnh nguồn trùng tuyệt đối là trường hợp riêng: nó chưa từng chứa watermark, vì vậy hệ thống xác
+nhận bằng SHA-256 của ảnh nguồn và không chạy bước trích xuất vốn chắc chắn không có dữ liệu để đọc.
 
 ## Quy trình cấp quyền đăng lại
 

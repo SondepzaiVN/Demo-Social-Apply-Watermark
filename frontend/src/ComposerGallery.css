@@ -790,6 +790,11 @@
 .provenance-owner dt { color: #8290a3; font-size: 9px; }
 .provenance-owner dd { overflow: hidden; margin: 3px 0 0; color: #2e425e; font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
 .provenance-owner div:nth-child(2) dd { color: #1769e0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
+.provenance-owner dd.watermark-evidence { font-family: inherit; letter-spacing: 0; }
+.provenance-owner dd.watermark-evidence.verified { color: #178050; }
+.provenance-owner dd.watermark-evidence.source-original { color: #1769e0; }
+.provenance-owner dd.watermark-evidence.not-extracted { color: #ae651e; }
+.watermark-evidence-note { margin: 11px 22px 0; padding: 9px 11px; border-radius: 9px; background: #fff6e8; color: #805b32; font-size: 10px; line-height: 1.5; }
 .provenance-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; padding: 18px 22px 22px; }
 .provenance-actions button { padding: 11px 13px; border-radius: 9px; background: #1769e0; color: #fff; font-size: 12px; font-weight: 750; }
 .provenance-actions button.secondary { border: 1px solid #d8e0ea; background: #fff; color: #40546d; }

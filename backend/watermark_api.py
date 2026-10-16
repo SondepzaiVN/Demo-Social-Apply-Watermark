@@ -28,6 +28,7 @@ USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTR
 DATA_LOCK = threading.RLock()
 FACEBOOK_MAX_SIDE, FACEBOOK_PREUPLOAD_JPEG_QUALITY = 2048, 100
 PHASH_SHORTLIST_DISTANCE = 18
+REGISTRY_EXTRACTION_LIMIT = 3
 
 
 class ProvenanceConflict(Exception):
@@ -227,6 +228,46 @@ def sift_evidence(query: np.ndarray, candidate: np.ndarray) -> dict:
     }
 
 
+def extract_identity_with_key(host: np.ndarray, key: dict) -> dict:
+    padded = extract_watermark(
+        host, key["safe_des_orig"], key["safe_kp_orig"], key["alpha"],
+        key["pos"], key["wm_shape"], seed=key["seed"], use_affine_correction=True,
+    )
+    height, width = key["orig_shape"]
+    recovered = padded[:height, :width]
+    extracted_raw = bin_image_to_text(
+        recovered, repeat_k=key["repeat_k"], payload_repeat=key["payload_repeat"],
+        encoding=key["text_encoding"], payload_seed=key["seed"],
+    ).strip()
+    expected = str(key.get("text_input", "")).strip()
+    # Account IDs in this application are exactly ten decimal digits. A damaged
+    # payload can still decode to arbitrary UTF-8; never expose that noise as an ID.
+    extracted = extracted_raw if re.fullmatch(r"\d{10}", extracted_raw) else ""
+    confidence = round(
+        100 * sum(first == second for first, second in zip(extracted_raw, expected)) /
+        max(len(expected), 1), 1
+    )
+    return {
+        "matched": extracted == expected and bool(expected),
+        "extractedId": extracted, "expectedId": expected, "confidence": confidence,
+    }
+
+
+def extract_registry_identity(host: np.ndarray, item: dict) -> dict:
+    key_file = item.get("keyFile", "")
+    if not key_file:
+        return {"matched": False, "extractedId": "", "expectedId": "", "confidence": 0.0,
+                "error": "Asset không có key trích xuất."}
+    try:
+        result = extract_identity_with_key(host, load_key_file(native_path(RUNTIME / key_file)))
+        owner_id = str(item.get("ownerAccountId", ""))
+        result["matched"] = bool(result["matched"] and result["extractedId"] == owner_id)
+        return result
+    except Exception as error:
+        return {"matched": False, "extractedId": "", "expectedId": str(item.get("ownerAccountId", "")),
+                "confidence": 0.0, "error": str(error)}
+
+
 def image_to_data_url(image: np.ndarray) -> str:
     ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, FACEBOOK_PREUPLOAD_JPEG_QUALITY])
     if not ok: raise ValueError("Không thể mã hóa ảnh watermark.")
@@ -298,9 +339,24 @@ def ensure_asset_registry() -> list[dict]:
 def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
     query_sha, query_phash = image_sha256(image), image_phash(image)
     for item in registry:
-        if query_sha in {item.get("sourceSha256"), item.get("watermarkedSha256")}:
-            return {**item, "matchMethod": "sha256", "pHashDistance": 0,
-                    "siftMatches": 0, "siftInliers": 0}
+        if query_sha == item.get("sourceSha256"):
+            return {
+                **item, "matchMethod": "sha256-source", "pHashDistance": 0,
+                "siftMatches": 0, "siftInliers": 0, "watermarkStatus": "source-original",
+                "extractedId": "", "extractionConfidence": 0.0,
+                "extractionCandidatesChecked": 0,
+            }
+        if query_sha == item.get("watermarkedSha256"):
+            extraction = extract_registry_identity(image, item)
+            return {
+                **item, "matchMethod": "sha256-watermarked", "pHashDistance": 0,
+                "siftMatches": 0, "siftInliers": 0,
+                "watermarkStatus": "verified" if extraction["matched"] else "not-extracted",
+                "extractedId": extraction.get("extractedId", ""),
+                "extractionConfidence": extraction.get("confidence", 0.0),
+                "extractionError": extraction.get("error", ""),
+                "extractionCandidatesChecked": 1,
+            }
 
     candidates = []
     for item in registry:
@@ -310,6 +366,7 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
         )
         if distance <= PHASH_SHORTLIST_DISTANCE:
             candidates.append((distance, item))
+    geometric_matches = []
     for distance, item in sorted(candidates, key=lambda pair: pair[0])[:20]:
         best = None
         for filename in (item.get("imageFile"), item.get("originalFile")):
@@ -322,15 +379,47 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
             if best is None or evidence["inliers"] > best["inliers"]:
                 best = evidence
             if evidence["matched"]:
-                return {
+                geometric_matches.append({
                     **item, "matchMethod": "phash+sift", "pHashDistance": distance,
                     "siftMatches": evidence["matches"], "siftInliers": evidence["inliers"],
-                }
+                    "siftInlierRatio": evidence["inlierRatio"],
+                })
+                break
         # Very close pHash is accepted only when both images lack enough SIFT evidence.
-        if distance <= 2 and best and best["matches"] == 0:
-            return {**item, "matchMethod": "phash", "pHashDistance": distance,
-                    "siftMatches": 0, "siftInliers": 0}
-    return None
+        if distance <= 2 and best and best["matches"] == 0 and not any(
+            match.get("id") == item.get("id") for match in geometric_matches
+        ):
+            geometric_matches.append({
+                **item, "matchMethod": "phash", "pHashDistance": distance,
+                "siftMatches": 0, "siftInliers": 0, "siftInlierRatio": 0.0,
+            })
+
+    if not geometric_matches:
+        return None
+    geometric_matches.sort(key=lambda item: (-item.get("siftInliers", 0), item["pHashDistance"]))
+    extraction_results = []
+    for candidate in geometric_matches[:REGISTRY_EXTRACTION_LIMIT]:
+        extraction = extract_registry_identity(image, candidate)
+        enriched = {
+            **candidate,
+            "watermarkStatus": "verified" if extraction["matched"] else "not-extracted",
+            "extractedId": extraction.get("extractedId", ""),
+            "extractionConfidence": extraction.get("confidence", 0.0),
+            "extractionError": extraction.get("error", ""),
+            "extractionCandidatesChecked": len(extraction_results) + 1,
+            "geometricCandidateCount": len(geometric_matches),
+        }
+        extraction_results.append(enriched)
+        if extraction["matched"]:
+            enriched["matchMethod"] = "phash+sift+watermark"
+            return enriched
+
+    # A geometrically strong match may be an original image that never contained a watermark,
+    # or a heavily attacked copy. Keep it related to the registered asset, but expose that the
+    # embedded identity could not be recovered instead of incorrectly treating it as a new image.
+    best_match = extraction_results[0]
+    best_match["extractionCandidatesChecked"] = len(extraction_results)
+    return best_match
 
 
 def artifact_from_registry(item: dict) -> dict:
@@ -388,6 +477,11 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                         "pHashDistance": matched.get("pHashDistance"),
                         "siftMatches": matched.get("siftMatches"),
                         "siftInliers": matched.get("siftInliers"),
+                        "watermarkStatus": matched.get("watermarkStatus", "not-extracted"),
+                        "extractedId": matched.get("extractedId", ""),
+                        "extractionConfidence": matched.get("extractionConfidence", 0.0),
+                        "extractionCandidatesChecked": matched.get("extractionCandidatesChecked", 0),
+                        "geometricCandidateCount": matched.get("geometricCandidateCount", 0),
                     })
                 if matched:
                     artifacts.append(artifact_from_registry(matched))
@@ -617,12 +711,10 @@ def verify(image_data: str, key_base64: str, owner_id: str) -> dict:
         temp.write(base64.b64decode(key_base64)); key_path = Path(temp.name)
     try:
         key = load_key_file(str(key_path))
-        padded = extract_watermark(host, key["safe_des_orig"], key["safe_kp_orig"], key["alpha"], key["pos"], key["wm_shape"], seed=key["seed"], use_affine_correction=True)
-        height, width = key["orig_shape"]; recovered = padded[:height, :width]
-        extracted = bin_image_to_text(recovered, repeat_k=key["repeat_k"], payload_repeat=key["payload_repeat"], encoding=key["text_encoding"], payload_seed=key["seed"]).strip()
-        expected = key["text_input"]; matched = extracted == expected == owner_id
-        confidence = 100.0 if matched else round(100 * sum(a == b for a, b in zip(extracted, expected)) / max(len(expected), 1), 1)
-        return {"matched": matched, "extractedId": extracted, "expectedId": expected, "extractedOwner": account_identity(extracted), "confidence": confidence}
+        result = extract_identity_with_key(host, key)
+        result["matched"] = bool(result["matched"] and result["extractedId"] == owner_id)
+        result["extractedOwner"] = account_identity(result["extractedId"])
+        return result
     finally: key_path.unlink(missing_ok=True)
 
 
