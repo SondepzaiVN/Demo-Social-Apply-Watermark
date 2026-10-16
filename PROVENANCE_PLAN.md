@@ -46,6 +46,11 @@ Yêu cầu và trạng thái cấp quyền được lưu tại `backend/runtime/
 Trang cá nhân của mỗi tài khoản tổng hợp riêng hai danh sách **Các bài viết cần duyệt** và
 **Đã gửi yêu cầu duyệt**, kèm preview và hành động phù hợp với vai trò hiện tại.
 
+Menu **Lịch sử xác minh** thủ công được thay bằng **Nhật ký bản quyền** tự động. Nhật ký ghi
+việc đăng ký ảnh mới, chặn lượt đăng ảnh trùng, gửi yêu cầu sử dụng, duyệt/từ chối và đăng bài
+đã được cấp quyền. File key `.npz` vẫn được chủ sở hữu tải về làm bằng chứng dự phòng, nhưng
+không còn là thao tác bắt buộc trong luồng kiểm tra chính của giao diện.
+
 Registry cục bộ nằm tại `backend/runtime/asset_registry.json`. Mỗi asset giữ dấu vân tay
 của cả ảnh nguồn và ảnh watermark, chủ sở hữu, file ảnh và file key.
 

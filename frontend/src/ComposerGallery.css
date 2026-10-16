@@ -714,6 +714,29 @@
 .history-detail dt { color: #8490a1; font-size: 9px; }
 .history-detail dd { margin: 0; color: #34475f; font-size: 11px; font-weight: 700; }
 
+.copyright-log-list { display: grid; gap: 12px; padding-top: 18px; }
+.copyright-log-item { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 15px; overflow: hidden; padding: 12px; border: 1px solid #e0e7f0; border-left: 4px solid #7d91aa; border-radius: 12px; background: #fff; }
+.copyright-log-item.protected { border-left-color: #22875a; }
+.copyright-log-item.blocked,
+.copyright-log-item.denied { border-left-color: #d55449; }
+.copyright-log-item.pending { border-left-color: #d38a2f; }
+.copyright-log-item.approved,
+.copyright-log-item.published { border-left-color: #1769e0; }
+.copyright-log-item > img,
+.copyright-log-placeholder { width: 132px; height: 112px; border-radius: 9px; object-fit: cover; background: #eef3f9; }
+.copyright-log-placeholder { display: grid; place-items: center; color: #6f97cc; }
+.copyright-log-placeholder .icon { width: 31px; height: 31px; }
+.copyright-log-content { min-width: 0; }
+.copyright-log-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.copyright-log-title b { color: #263b55; font-size: 13px; }
+.copyright-log-title span { flex: none; color: #8996a7; font-size: 9px; }
+.copyright-log-content > p { margin: 5px 0 0; color: #607086; font-size: 10px; line-height: 1.5; }
+.copyright-log-content blockquote { margin: 8px 0 0; padding: 7px 9px; border-left: 2px solid #cbd8e8; border-radius: 0 6px 6px 0; background: #f6f8fb; color: #465971; font-size: 10px; }
+.copyright-log-content dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 18px; margin: 11px 0 0; }
+.copyright-log-content dl div { min-width: 0; }
+.copyright-log-content dt { color: #8996a7; font-size: 8px; }
+.copyright-log-content dd { overflow: hidden; margin: 2px 0 0; color: #34475f; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+
 .gallery-heading,
 .gallery-heading > div {
   display: flex;
@@ -827,6 +850,10 @@
   .history-item > img,
   .history-placeholder { width: 82px; height: 76px; }
   .history-detail dl { gap: 12px; }
+  .copyright-log-item { grid-template-columns: 88px minmax(0, 1fr); }
+  .copyright-log-item > img,
+  .copyright-log-placeholder { width: 88px; height: 82px; }
+  .copyright-log-content dl { grid-template-columns: 1fr; }
   .image-only-gallery,
   .profile-photo-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .search-dropdown { position: fixed; top: 62px; left: 10px; right: 10px; width: auto; }

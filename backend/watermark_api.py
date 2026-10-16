@@ -19,10 +19,10 @@ from models.watermark_pipeline import (  # noqa: E402
 
 RUNTIME = Path(__file__).resolve().parent / "runtime"
 RUNTIME.mkdir(exist_ok=True)
-USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTRY_FILE, LICENSES_FILE = (
+USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTRY_FILE, LICENSES_FILE, COPYRIGHT_LOG_FILE = (
     RUNTIME / name for name in (
         "users.json", "posts.json", "sessions.json", "verification_history.json",
-        "notifications.json", "asset_registry.json", "license_requests.json",
+        "notifications.json", "asset_registry.json", "license_requests.json", "copyright_log.json",
     )
 )
 DATA_LOCK = threading.RLock()
@@ -49,6 +49,20 @@ def write_json(path: Path, value) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def append_copyright_event(event_type: str, participants: list[str], **details) -> dict:
+    """Persist a compact audit event without storing another copy of the image."""
+    record = {
+        "id": str(uuid.uuid4()), "type": event_type,
+        "participants": list(dict.fromkeys(item for item in participants if item)),
+        "createdAt": datetime.now(timezone.utc).isoformat(), **details,
+    }
+    with DATA_LOCK:
+        events = read_json(COPYRIGHT_LOG_FILE, [])
+        events.insert(0, record)
+        write_json(COPYRIGHT_LOG_FILE, events[:1000])
+    return record
 
 
 def new_account_id(users: dict) -> str:
@@ -467,7 +481,7 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                     matched.get("id", ""), username, current_draft_hash, license_request_id
                 ) if matched else None
                 if matched and matched.get("ownerUsername") != username and not license_record:
-                    raise ProvenanceConflict({
+                    conflict = {
                         "imageIndex": index, "assetId": matched.get("id", ""),
                         "ownerUsername": matched.get("ownerUsername", ""),
                         "ownerDisplayName": matched.get("ownerDisplayName", ""),
@@ -482,7 +496,19 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                         "extractionConfidence": matched.get("extractionConfidence", 0.0),
                         "extractionCandidatesChecked": matched.get("extractionCandidatesChecked", 0),
                         "geometricCandidateCount": matched.get("geometricCandidateCount", 0),
-                    })
+                    }
+                    append_copyright_event(
+                        "upload_blocked", [username, conflict["ownerUsername"]],
+                        assetId=conflict["assetId"], ownerUsername=conflict["ownerUsername"],
+                        ownerDisplayName=conflict["ownerDisplayName"],
+                        ownerAccountId=conflict["ownerAccountId"],
+                        actorUsername=username, actorDisplayName=user.get("displayName", username),
+                        actorAccountId=str(user.get("accountId", "")), caption=caption.strip(),
+                        matchMethod=conflict["matchMethod"], watermarkStatus=conflict["watermarkStatus"],
+                        extractedId=conflict["extractedId"],
+                        extractionConfidence=conflict["extractionConfidence"],
+                    )
+                    raise ProvenanceConflict(conflict)
                 if matched:
                     artifacts.append(artifact_from_registry(matched))
                     if matched.get("ownerUsername") == username:
@@ -513,6 +539,16 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
             result = public_post(post, username)
             posts = read_json(POSTS_FILE, []); posts.insert(0, post)
             write_json(REGISTRY_FILE, registry); write_json(POSTS_FILE, posts)
+            for record in new_records:
+                append_copyright_event(
+                    "asset_registered", [username], assetId=record["id"],
+                    ownerUsername=username, ownerDisplayName=user.get("displayName", username),
+                    ownerAccountId=str(user.get("accountId", "")),
+                    actorUsername=username, actorDisplayName=user.get("displayName", username),
+                    actorAccountId=str(user.get("accountId", "")), caption=caption.strip(),
+                    matchMethod="new", watermarkStatus="embedded",
+                    extractedId=str(user.get("accountId", "")),
+                )
         return result
     except Exception:
         for artifact in created_artifacts:
@@ -835,6 +871,17 @@ def request_image_license(asset_id: str, payload: dict, username: str, user: dic
             "createdAt": now, "read": False,
         })
         write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts[:500])
+        append_copyright_event(
+            "license_requested", [record["ownerUsername"], username],
+            requestId=record["id"], assetId=asset_id,
+            ownerUsername=record["ownerUsername"], ownerDisplayName=record["ownerDisplayName"],
+            ownerAccountId=record["ownerAccountId"], actorUsername=username,
+            actorDisplayName=record["requesterDisplayName"],
+            actorAccountId=record["requesterAccountId"], caption=caption,
+            matchMethod=matched.get("matchMethod", ""),
+            watermarkStatus=matched.get("watermarkStatus", "not-extracted"),
+            extractedId=matched.get("extractedId", ""),
+        )
         return record
 
 
@@ -870,6 +917,17 @@ def respond_image_license(request_id: str, decision: str, username: str) -> dict
             "createdAt": now, "read": False,
         })
         write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts[:500])
+        append_copyright_event(
+            "license_approved" if approved else "license_denied",
+            [record["ownerUsername"], record["requesterUsername"]],
+            requestId=request_id, assetId=record["assetId"],
+            ownerUsername=record["ownerUsername"], ownerDisplayName=record["ownerDisplayName"],
+            ownerAccountId=record["ownerAccountId"],
+            actorUsername=record["requesterUsername"],
+            actorDisplayName=record["requesterDisplayName"],
+            actorAccountId=record["requesterAccountId"],
+            caption=record.get("draftCaption", ""),
+        )
         return {"id": request_id, "status": decision}
 
 
@@ -899,6 +957,15 @@ def publish_approved_license(request_id: str, username: str, user: dict) -> dict
             if alert.get("requestId") == request_id:
                 alert["requestStatus"] = "published"
         write_json(LICENSES_FILE, requests); write_json(NOTIFICATIONS_FILE, alerts)
+        append_copyright_event(
+            "licensed_post_published", [record["ownerUsername"], record["requesterUsername"]],
+            requestId=request_id, assetId=record["assetId"], postId=post["id"],
+            ownerUsername=record["ownerUsername"], ownerDisplayName=record["ownerDisplayName"],
+            ownerAccountId=record["ownerAccountId"],
+            actorUsername=record["requesterUsername"],
+            actorDisplayName=record["requesterDisplayName"],
+            actorAccountId=record["requesterAccountId"], caption=record.get("draftCaption", ""),
+        )
         return post
 
 
@@ -909,6 +976,74 @@ def mark_notifications_read(username: str) -> dict:
             if item.get("username") == username: item["read"] = True
         write_json(NOTIFICATIONS_FILE, items)
     return {"ok": True}
+
+
+def copyright_log(username: str) -> list[dict]:
+    """Return automatic provenance and permission events visible to this account."""
+    events = list(read_json(COPYRIGHT_LOG_FILE, []))
+    known = {(item.get("type"), item.get("requestId")) for item in events if item.get("requestId")}
+    registry_items = ensure_asset_registry()
+    registered_assets = {item.get("assetId") for item in events if item.get("type") == "asset_registered"}
+
+    for asset in registry_items:
+        asset_id = asset.get("id", "")
+        if asset_id in registered_assets:
+            continue
+        events.append({
+            "id": f"legacy-asset-{asset_id}", "type": "asset_registered",
+            "participants": [asset.get("ownerUsername", "")], "assetId": asset_id,
+            "ownerUsername": asset.get("ownerUsername", ""),
+            "ownerDisplayName": asset.get("ownerDisplayName", ""),
+            "ownerAccountId": asset.get("ownerAccountId", ""),
+            "actorUsername": asset.get("ownerUsername", ""),
+            "actorDisplayName": asset.get("ownerDisplayName", ""),
+            "actorAccountId": asset.get("ownerAccountId", ""),
+            "createdAt": asset.get("createdAt", ""), "matchMethod": "new",
+            "watermarkStatus": "embedded", "extractedId": asset.get("ownerAccountId", ""),
+        })
+
+    # Existing license data predates the audit log. Project it into the new view so
+    # users do not lose context when upgrading from the manual verification screen.
+    for request in read_json(LICENSES_FILE, []):
+        common = {
+            "participants": [request.get("ownerUsername", ""), request.get("requesterUsername", "")],
+            "requestId": request.get("id", ""), "assetId": request.get("assetId", ""),
+            "ownerUsername": request.get("ownerUsername", ""),
+            "ownerDisplayName": request.get("ownerDisplayName", ""),
+            "ownerAccountId": request.get("ownerAccountId", ""),
+            "actorUsername": request.get("requesterUsername", ""),
+            "actorDisplayName": request.get("requesterDisplayName", ""),
+            "actorAccountId": request.get("requesterAccountId", ""),
+            "caption": request.get("draftCaption", ""),
+        }
+        request_id = request.get("id", "")
+        if ("license_requested", request_id) not in known:
+            events.append({"id": f"legacy-request-{request_id}", "type": "license_requested",
+                           "createdAt": request.get("createdAt", ""), **common})
+        final_type = "licensed_post_published" if request.get("consumedAt") else (
+            "license_approved" if request.get("status") == "approved" else
+            "license_denied" if request.get("status") == "denied" else ""
+        )
+        if final_type and (final_type, request_id) not in known:
+            events.append({"id": f"legacy-result-{request_id}", "type": final_type,
+                           "createdAt": request.get("consumedAt") or request.get("respondedAt", ""),
+                           "postId": request.get("postId", ""), **common})
+
+    registry = {item.get("id"): item for item in registry_items}
+    result = []
+    for source in events:
+        if username not in source.get("participants", []):
+            continue
+        item = dict(source)
+        item["perspective"] = "owner" if source.get("ownerUsername") == username else "requester"
+        asset = registry.get(source.get("assetId"))
+        if asset and asset.get("imageFile"):
+            try:
+                item["image"] = image_to_data_url(read_image(RUNTIME / asset["imageFile"]))
+            except (FileNotFoundError, ValueError):
+                item["image"] = ""
+        result.append(item)
+    return sorted(result, key=lambda item: item.get("createdAt", ""), reverse=True)
 
 
 def verification_history(username: str) -> list[dict]:
@@ -945,6 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path); path = parsed.path; query = parse_qs(parsed.query)
             if path == "/api/feed": result = feed(username)
             elif path == "/api/assets": result = assets(username)
+            elif path == "/api/copyright-log": result = copyright_log(username)
             elif path == "/api/verifications": result = verification_history(username)
             elif path == "/api/notifications": result = notifications(username)
             elif path == "/api/licenses": result = license_center(username)

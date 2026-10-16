@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import './App.css'
 import './Auth.css'
@@ -14,8 +14,7 @@ type Comment = { id: string; username: string; author: string; text: string; cre
 type ImageLicense = { requestId: string; assetId: string; ownerUsername: string; ownerDisplayName: string; ownerAccountId: string; approvedAt: string }
 type Post = { id: string; username: string; author: string; accountId: string; caption: string; image: string; images?: string[]; createdAt: string; likes: number; liked: boolean; comments: Comment[]; reported: boolean; provenance?: { status: 'new' | 'reused' | 'licensed'; reusedCount: number; licensedCount?: number; newCount: number }; licenses?: ImageLicense[] }
 type Asset = Post & { keyBase64: string }
-type Verification = { matched: boolean; extractedId?: string; expectedId?: string; extractedOwner?: string; confidence?: number; historyId?: string; message: string }
-type VerificationHistory = { id: string; postId: string; imageIndex: number; method: 'vault' | 'file'; sourceName: string; matched: boolean; extractedId: string; expectedId: string; extractedOwner?: string; confidence: number; createdAt: string; image?: string; postAuthor?: string; caption?: string; action?: string }
+type CopyrightEvent = { id: string; type: 'asset_registered' | 'upload_blocked' | 'license_requested' | 'license_approved' | 'license_denied' | 'licensed_post_published'; createdAt: string; perspective: 'owner' | 'requester'; ownerDisplayName: string; ownerAccountId: string; actorDisplayName: string; actorAccountId: string; caption?: string; image?: string; matchMethod?: string; watermarkStatus?: string; extractedId?: string; extractionConfidence?: number }
 type Notification = { id: string; type: string; title: string; message: string; ownerName: string; ownerAccountId: string; postCaption: string; createdAt: string; read: boolean; requestId?: string; requestStatus?: 'pending' | 'approved' | 'denied' | 'published'; requesterName?: string; requesterAccountId?: string; draftCaption?: string; draftImages?: string[]; licensedImageIndex?: number }
 type LicenseRequestSummary = { id: string; assetId: string; status: 'pending' | 'approved' | 'denied' | 'published'; ownerUsername: string; ownerDisplayName: string; ownerAccountId: string; requesterUsername: string; requesterDisplayName: string; requesterAccountId: string; draftCaption: string; draftImages: string[]; imageIndex: number; createdAt: string; respondedAt?: string; postId?: string }
 type LicenseCenter = { incoming: LicenseRequestSummary[]; outgoing: LicenseRequestSummary[] }
@@ -48,7 +47,15 @@ function Icon({ name }: { name: keyof typeof paths }) {
 }
 function initials(name: string) { return name.split(/\s+/).slice(-2).map((part) => part[0]).join('').toUpperCase() || 'U' }
 function timeLabel(value: string) { const minutes = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 60000)); if (minutes < 1) return 'Vừa xong'; if (minutes < 60) return `${minutes} phút`; if (minutes < 1440) return `${Math.floor(minutes / 60)} giờ`; return new Date(value).toLocaleDateString('vi-VN') }
-function matchMethodLabel(value: string) { if (value === 'sha256-source') return 'Trùng khớp ảnh nguồn'; if (value === 'sha256-watermarked') return 'Trùng khớp ảnh watermark'; if (value === 'phash+sift+watermark') return 'pHash + SIFT + watermark'; if (value === 'phash+sift') return 'pHash + SIFT xác nhận'; return 'pHash tương đồng cao' }
+function matchMethodLabel(value: string) { if (value === 'new') return 'Ảnh mới'; if (value === 'sha256-source') return 'Trùng khớp ảnh nguồn'; if (value === 'sha256-watermarked') return 'Trùng khớp ảnh watermark'; if (value === 'phash+sift+watermark') return 'pHash + SIFT + watermark'; if (value === 'phash+sift') return 'pHash + SIFT xác nhận'; return 'pHash tương đồng cao' }
+function copyrightEventText(item: CopyrightEvent) {
+  if (item.type === 'asset_registered') return { tone: 'protected', title: 'Ảnh đã được đăng ký bảo vệ', description: `Watermark Account ID ${item.ownerAccountId} đã được nhúng và key riêng đã được lưu.` }
+  if (item.type === 'upload_blocked') return { tone: 'blocked', title: item.perspective === 'owner' ? 'Đã chặn một lượt đăng lại ảnh' : 'Ảnh tải lên đã bị chặn', description: item.perspective === 'owner' ? `${item.actorDisplayName} (ID ${item.actorAccountId}) đã tải lên ảnh thuộc kho của bạn.` : `Ảnh được xác định thuộc ${item.ownerDisplayName} (ID ${item.ownerAccountId}) nên chưa được đăng.` }
+  if (item.type === 'license_requested') return { tone: 'pending', title: item.perspective === 'owner' ? 'Có yêu cầu sử dụng ảnh mới' : 'Đã gửi yêu cầu sử dụng ảnh', description: item.perspective === 'owner' ? `${item.actorDisplayName} đã gửi bản nháp để bạn xem xét.` : `Bản nháp đã được gửi đến ${item.ownerDisplayName} để duyệt.` }
+  if (item.type === 'license_approved') return { tone: 'approved', title: 'Yêu cầu sử dụng ảnh đã được chấp thuận', description: `${item.ownerDisplayName} đã cho phép đăng đúng nội dung bản nháp.` }
+  if (item.type === 'license_denied') return { tone: 'denied', title: 'Yêu cầu sử dụng ảnh đã bị từ chối', description: `${item.ownerDisplayName} chưa đồng ý cho sử dụng ảnh trong bản nháp.` }
+  return { tone: 'published', title: 'Bài viết được cấp quyền đã được đăng', description: `${item.actorDisplayName} đã đăng bản nháp được duyệt và giữ nguyên watermark của ${item.ownerDisplayName}.` }
+}
 
 async function request<T>(path: string, options: RequestInit = {}, token = ''): Promise<T> {
   const response = await fetch(`${API}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers } })
@@ -93,20 +100,16 @@ function App() {
   const [session, setSession] = useState<Session | null>(() => { try { return JSON.parse(localStorage.getItem(AUTH_STORAGE) || 'null') } catch { return null } })
   const [posts, setPosts] = useState<Post[]>([])
   const [assets, setAssets] = useState<Asset[]>([])
-  const [history, setHistory] = useState<VerificationHistory[]>([])
+  const [copyrightLog, setCopyrightLog] = useState<CopyrightEvent[]>([])
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [licenseCenter, setLicenseCenter] = useState<LicenseCenter>({ incoming: [], outgoing: [] })
   const [licenseTab, setLicenseTab] = useState<'incoming' | 'outgoing'>('incoming')
-  const [activePage, setActivePage] = useState<'feed' | 'gallery' | 'history' | 'profile'>('feed')
+  const [activePage, setActivePage] = useState<'feed' | 'gallery' | 'copyright' | 'profile'>('feed')
   const [composerOpen, setComposerOpen] = useState(false)
   const [caption, setCaption] = useState('')
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  const [verifyPost, setVerifyPost] = useState<Post | null>(null)
-  const [selectedAssetId, setSelectedAssetId] = useState('')
-  const [verifyMode, setVerifyMode] = useState<'vault' | 'file'>('vault')
-  const [verification, setVerification] = useState<Verification | null>(null)
   const [photoViewer, setPhotoViewer] = useState<{post: Post; image: string} | null>(null)
   const [openComments, setOpenComments] = useState<string[]>([])
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({})
@@ -121,16 +124,15 @@ function App() {
   const [provenanceConflict, setProvenanceConflict] = useState<ProvenanceDetails | null>(null)
   const [licenseBusy, setLicenseBusy] = useState(false)
   const imageInput = useRef<HTMLInputElement>(null)
-  const keyInput = useRef<HTMLInputElement>(null)
 
   const signOut = useCallback(async () => {
     if (session) request('/logout', { method: 'POST', body: '{}' }, session.token).catch(() => undefined)
-    localStorage.removeItem(AUTH_STORAGE); setSession(null); setPosts([]); setAssets([]); setHistory([]); setNotifications([]); setLicenseCenter({ incoming: [], outgoing: [] })
+    localStorage.removeItem(AUTH_STORAGE); setSession(null); setPosts([]); setAssets([]); setCopyrightLog([]); setNotifications([]); setLicenseCenter({ incoming: [], outgoing: [] })
   }, [session])
   const loadData = useCallback(async (active: Session) => {
     try {
-      const [feed, own, checks, alerts, licenses] = await Promise.all([request<Post[]>('/feed', {}, active.token), request<Asset[]>('/assets', {}, active.token), request<VerificationHistory[]>('/verifications', {}, active.token), request<Notification[]>('/notifications', {}, active.token), request<LicenseCenter>('/licenses', {}, active.token)])
-      setPosts(feed); setAssets(own); setHistory(checks); setNotifications(alerts); setLicenseCenter(licenses)
+      const [feed, own, audit, alerts, licenses] = await Promise.all([request<Post[]>('/feed', {}, active.token), request<Asset[]>('/assets', {}, active.token), request<CopyrightEvent[]>('/copyright-log', {}, active.token), request<Notification[]>('/notifications', {}, active.token), request<LicenseCenter>('/licenses', {}, active.token)])
+      setPosts(feed); setAssets(own); setCopyrightLog(audit); setNotifications(alerts); setLicenseCenter(licenses)
     } catch (reason) { if (reason instanceof Error && reason.message.includes('Phiên đăng nhập')) signOut(); else setNotice(reason instanceof Error ? reason.message : 'Không tải được dữ liệu.') }
   }, [signOut])
   useEffect(() => {
@@ -144,7 +146,6 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [searchQuery, session])
 
-  const chosenAsset = useMemo(() => assets.find((asset) => asset.id === selectedAssetId), [assets, selectedAssetId])
   async function chooseImages(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []).filter((file) => file.type.startsWith('image/'))
     event.target.value = ''
@@ -174,6 +175,7 @@ function App() {
     catch (reason) {
       if (reason instanceof ApiError && reason.code === 'PROVENANCE_CONFLICT' && reason.details) {
         setProvenanceConflict(reason.details); setNotice('')
+        request<CopyrightEvent[]>('/copyright-log', {}, session.token).then(setCopyrightLog).catch(() => undefined)
       } else setNotice(reason instanceof Error ? reason.message : 'Không thể đăng ảnh.')
     }
     finally { setBusy(false) }
@@ -224,6 +226,10 @@ function App() {
     if (!active) return
     setLicenseCenter(await request<LicenseCenter>('/licenses', {}, active.token))
   }
+  async function refreshCopyrightLog(active = session) {
+    if (!active) return
+    setCopyrightLog(await request<CopyrightEvent[]>('/copyright-log', {}, active.token))
+  }
   async function askForLicense() {
     if (!session || !provenanceConflict) return
     setLicenseBusy(true)
@@ -231,7 +237,7 @@ function App() {
       const result = await request<{status:string; alreadyExists?:boolean}>('/licenses/request', { method: 'POST', body: JSON.stringify({ assetId: provenanceConflict.assetId, caption, images: pendingImages, imageIndex: provenanceConflict.imageIndex }) }, session.token)
       const message = result.status === 'approved' ? 'Bản nháp này đã được chủ sở hữu duyệt. Hãy mở thông báo để đăng bài.' : result.alreadyExists ? 'Bản nháp này đang chờ chủ sở hữu phản hồi.' : 'Đã gửi toàn bộ bản nháp đến chủ sở hữu để xem trước.'
       setProvenanceConflict(null); setComposerOpen(false); setCaption(''); setPendingImages([]); setNotice(message)
-      await refreshLicenseCenter(session)
+      await Promise.all([refreshLicenseCenter(session), refreshCopyrightLog(session)])
     } catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Không thể gửi yêu cầu sử dụng ảnh.') }
     finally { setLicenseBusy(false) }
   }
@@ -241,7 +247,7 @@ function App() {
     try {
       await request('/licenses/respond', { method: 'POST', body: JSON.stringify({ requestId, decision }) }, session.token)
       setNotifications((current) => current.map((notification) => notification.requestId === requestId ? { ...notification, requestStatus: decision, read: true } : notification))
-      await refreshLicenseCenter(session)
+       await Promise.all([refreshLicenseCenter(session), refreshCopyrightLog(session)])
       setNotice(decision === 'approved' ? 'Đã cấp quyền. Người yêu cầu có thể đăng lại ảnh với watermark gốc.' : 'Đã từ chối yêu cầu sử dụng ảnh.')
     } catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Không thể phản hồi yêu cầu.') }
   }
@@ -251,8 +257,8 @@ function App() {
     try {
       const post = await request<Post>('/licenses/publish', { method: 'POST', body: JSON.stringify({ requestId }) }, session.token)
       setPosts((current) => [post, ...current])
-      const [own, alerts, licenses] = await Promise.all([request<Asset[]>('/assets', {}, session.token), request<Notification[]>('/notifications', {}, session.token), request<LicenseCenter>('/licenses', {}, session.token)])
-      setAssets(own); setNotifications(alerts); setLicenseCenter(licenses); setNotificationsOpen(false)
+      const [own, alerts, licenses, audit] = await Promise.all([request<Asset[]>('/assets', {}, session.token), request<Notification[]>('/notifications', {}, session.token), request<LicenseCenter>('/licenses', {}, session.token), request<CopyrightEvent[]>('/copyright-log', {}, session.token)])
+      setAssets(own); setNotifications(alerts); setLicenseCenter(licenses); setCopyrightLog(audit); setNotificationsOpen(false)
       setNotice('Đã đăng đúng bản nháp được chủ sở hữu chấp thuận. Watermark gốc được giữ nguyên.')
     } catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Không thể đăng bản nháp đã duyệt.') }
   }
@@ -265,25 +271,6 @@ function App() {
     const personId = direction === 'incoming' ? item.requesterAccountId : item.ownerAccountId
     return <article className="license-center-card" key={item.id}><header><span className="avatar">{initials(personName)}</span><div><b>{personName}</b><small>Account ID {personId} · {timeLabel(item.createdAt)}</small></div><span className={`license-center-status ${item.status}`}>{statusLabel}</span></header>{item.draftCaption ? <p>{item.draftCaption}</p> : <p className="empty-caption">Bài viết không có nội dung chữ.</p>}<div className={`license-center-images count-${Math.min(item.draftImages.length, 4)}`}>{item.draftImages.slice(0, 4).map((image, index) => <figure key={index}><img src={image} alt={`Ảnh bản nháp ${index + 1}`}/>{index === item.imageIndex && <span>Ảnh bản quyền</span>}{index === 3 && item.draftImages.length > 4 && <i>+{item.draftImages.length - 4}</i>}</figure>)}</div>{direction === 'incoming' && item.status === 'pending' && <footer><button onClick={() => respondToLicense(item, 'denied')}>Từ chối</button><button className="approve" onClick={() => respondToLicense(item, 'approved')}>Cho phép đăng</button></footer>}{direction === 'outgoing' && item.status === 'approved' && <footer><button className="approve publish" onClick={() => publishApprovedDraft(item)}>Đăng bài đã duyệt</button></footer>}</article>
   }
-  async function verify(keyBase64: string, sourceName = '') {
-    if (!session || !verifyPost) return; setBusy(true); setVerification(null)
-    const imageIndex = Math.max(0, (verifyPost.images || [verifyPost.image]).indexOf(verifyPost.image))
-    try {
-      const result = await request<{matched:boolean; extractedId:string; expectedId:string; extractedOwner:string; confidence:number; historyId:string}>('/verify', { method: 'POST', body: JSON.stringify({ image: verifyPost.image, keyBase64, postId: verifyPost.id, imageIndex, method: verifyMode, sourceName }) }, session.token)
-      const resolved: Verification = result.matched ? { ...result, message: `Watermark xác nhận ảnh thuộc về ${result.extractedOwner || 'tài khoản của bạn'} (Account ID ${result.extractedId}).` } : { ...result, message: `Không đủ bằng chứng quyền sở hữu. ID trích xuất: ${result.extractedId || 'không đọc được'}.` }
-      setVerification(resolved); setHistory(await request<VerificationHistory[]>('/verifications', {}, session.token))
-      if (result.matched) {
-        await request('/report', { method: 'POST', body: JSON.stringify({ postId: verifyPost.id, historyId: result.historyId }) }, session.token)
-        setPosts((current) => current.filter((post) => post.id !== verifyPost.id))
-        setVerification({ ...resolved, message: `Ảnh thuộc quyền sở hữu của ${result.extractedOwner || 'tài khoản của bạn'} — Account ID ${result.extractedId}. Bài viết vi phạm đã được tự động gỡ bỏ.` })
-        setHistory(await request<VerificationHistory[]>('/verifications', {}, session.token))
-      }
-    }
-    catch (reason) { setVerification({ matched: false, message: reason instanceof Error ? reason.message : 'Không thể xác minh.' }) }
-    finally { setBusy(false) }
-  }
-  function readKey(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => verify(String(reader.result).split(',').pop() || '', file.name); reader.readAsDataURL(file); event.target.value = '' }
-
   if (!session) return <AuthScreen onAuthenticated={(value) => { localStorage.setItem(AUTH_STORAGE, JSON.stringify(value)); setSession(value) }}/>
   return <div className="app-shell">
     <header className="topbar">
@@ -292,7 +279,7 @@ function App() {
       <div className="top-actions"><div className="notification-wrap"><button className="notification-button" onClick={toggleNotifications} title="Thông báo"><Icon name="bell"/>{notifications.some((item) => !item.read) && <span>{Math.min(9, notifications.filter((item) => !item.read).length)}{notifications.filter((item) => !item.read).length > 9 ? '+' : ''}</span>}</button>{notificationsOpen && <section className="notification-dropdown"><header><h3>Thông báo</h3><span>{notifications.length} thông báo</span></header>{notifications.length === 0 ? <div className="notification-empty"><Icon name="bell"/><p>Bạn chưa có thông báo mới.</p></div> : <div className="notification-list">{notifications.map(renderNotification)}</div>}</section>}</div><button className="profile-compact" onClick={() => openProfile(session.username)}><div className="user-compact"><span>{session.displayName}</span><small>ID {session.accountId}</small></div><span className="avatar mine">{initials(session.displayName)}</span></button><button className="logout-button" onClick={signOut} title="Đăng xuất"><Icon name="logout"/></button></div>
     </header>
     <main className="layout">
-      <aside className="leftbar"><button className="profile-row" onClick={() => openProfile(session.username)}><span className="avatar large mine">{initials(session.displayName)}</span><div><b>{session.displayName}</b><small>{session.username}</small></div></button><button className={`side-link ${activePage === 'feed' ? 'active' : ''}`} onClick={() => setActivePage('feed')}><Icon name="home"/>Bảng tin</button><button className={`side-link ${activePage === 'gallery' ? 'active' : ''}`} onClick={() => setActivePage('gallery')}><Icon name="image"/>Kho bản quyền <span className="badge">{assets.length}</span></button><button className={`side-link ${activePage === 'history' ? 'active' : ''}`} onClick={() => setActivePage('history')}><Icon name="check"/>Lịch sử xác minh</button></aside>
+      <aside className="leftbar"><button className="profile-row" onClick={() => openProfile(session.username)}><span className="avatar large mine">{initials(session.displayName)}</span><div><b>{session.displayName}</b><small>{session.username}</small></div></button><button className={`side-link ${activePage === 'feed' ? 'active' : ''}`} onClick={() => setActivePage('feed')}><Icon name="home"/>Bảng tin</button><button className={`side-link ${activePage === 'gallery' ? 'active' : ''}`} onClick={() => setActivePage('gallery')}><Icon name="image"/>Kho bản quyền <span className="badge">{assets.length}</span></button><button className={`side-link ${activePage === 'copyright' ? 'active' : ''}`} onClick={() => { setActivePage('copyright'); refreshCopyrightLog() }}><Icon name="shield"/>Nhật ký bản quyền</button></aside>
       {activePage === 'feed' ? <section className="feed">
         <section className="composer compact-composer"><span className="avatar mine">{initials(session.displayName)}</span><button className="composer-prompt" onClick={() => openComposer()}>{session.displayName.trim().split(/\s+/).slice(-1)[0]} ơi, bạn đang nghĩ gì thế?</button><button className="composer-photo" type="button" onClick={() => openComposer(true)} title="Chọn ảnh từ máy"><Icon name="image"/><span>Ảnh</span></button></section>
         {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>×</button></div>}
@@ -310,9 +297,9 @@ function App() {
       </section> : activePage === 'gallery' ? <section className="gallery-page">
         <div className="gallery-heading"><div><span className="gallery-icon"><Icon name="shield"/></span><div><h1>Kho bản quyền</h1><p>Quản lý ảnh đã được nhúng watermark và tải key xác minh.</p></div></div><span>{assets.length} ảnh</span></div>
         {assets.length === 0 ? <div className="gallery-empty"><Icon name="image"/><h3>Kho bản quyền đang trống</h3><p>Ảnh bạn đăng sẽ xuất hiện tại đây cùng key `.npz` riêng.</p></div> : <div className="gallery-grid image-only-gallery">{assets.map((asset) => <article className="gallery-card" key={asset.id}><img src={asset.image} alt="Ảnh bản quyền"/><div className="gallery-overlay"><button onClick={() => downloadKey(asset)}><Icon name="download"/> Tải key `.npz`</button></div></article>)}</div>}
-      </section> : activePage === 'history' ? <section className="history-page">
-        <div className="gallery-heading"><div><span className="gallery-icon"><Icon name="check"/></span><div><h1>Lịch sử xác minh</h1><p>Các lần kiểm tra watermark bằng key của tài khoản này.</p></div></div><span>{history.length} lần</span></div>
-        {history.length === 0 ? <div className="gallery-empty"><Icon name="check"/><h3>Chưa có lần xác minh nào</h3><p>Kết quả kiểm tra ảnh nghi ngờ sẽ được lưu và hiển thị tại đây.</p></div> : <div className="history-list">{history.map((item) => <article className="history-item" key={item.id}>{item.image ? <img src={item.image} alt={item.caption || 'Ảnh đã xác minh'}/> : <span className="history-placeholder"><Icon name="image"/></span>}<div className="history-detail"><div><b>{item.caption || 'Ảnh đã xác minh'}</b><span className={item.matched ? 'history-status matched' : 'history-status unmatched'}>{item.matched ? 'Khớp bản quyền' : 'Không khớp'}</span></div><small>{timeLabel(item.createdAt)} · {item.method === 'vault' ? 'Key từ kho bản quyền' : `File ${item.sourceName || '.npz'}`}</small><dl><div><dt>ID trích xuất</dt><dd>{item.extractedId || 'Không đọc được'}</dd></div><div><dt>Độ tin cậy</dt><dd>{item.confidence}%</dd></div></dl></div></article>)}</div>}
+      </section> : activePage === 'copyright' ? <section className="history-page copyright-log-page">
+        <div className="gallery-heading"><div><span className="gallery-icon"><Icon name="shield"/></span><div><h1>Nhật ký bản quyền</h1><p>Các sự kiện được hệ thống tự động ghi nhận trong quá trình bảo vệ ảnh.</p></div></div><span>{copyrightLog.length} sự kiện</span></div>
+        {copyrightLog.length === 0 ? <div className="gallery-empty"><Icon name="shield"/><h3>Chưa có sự kiện bản quyền</h3><p>Khi bạn đăng ảnh hoặc hệ thống phát hiện ảnh trùng, kết quả sẽ tự động xuất hiện tại đây.</p></div> : <div className="copyright-log-list">{copyrightLog.map((item) => { const meta = copyrightEventText(item); return <article className={`copyright-log-item ${meta.tone}`} key={item.id}>{item.image ? <img src={item.image} alt="Ảnh bản quyền"/> : <span className="copyright-log-placeholder"><Icon name="shield"/></span>}<div className="copyright-log-content"><div className="copyright-log-title"><b>{meta.title}</b><span>{timeLabel(item.createdAt)}</span></div><p>{meta.description}</p>{item.caption && <blockquote>{item.caption}</blockquote>}<dl><div><dt>Chủ sở hữu</dt><dd>{item.ownerDisplayName || 'Không xác định'} · ID {item.ownerAccountId || '—'}</dd></div>{item.actorDisplayName && <div><dt>Tài khoản thao tác</dt><dd>{item.actorDisplayName} · ID {item.actorAccountId || '—'}</dd></div>}{item.matchMethod && <div><dt>Đối sánh</dt><dd>{matchMethodLabel(item.matchMethod)}</dd></div>}<div><dt>Watermark</dt><dd>{item.extractedId ? `Đã đọc ID ${item.extractedId}` : item.watermarkStatus === 'source-original' ? 'Ảnh nguồn, không áp dụng trích xuất' : item.type === 'upload_blocked' ? 'Không khôi phục được ID' : 'Đã được hệ thống bảo vệ'}</dd></div></dl></div></article> })}</div>}
       </section> : <section className="profile-page">{profile ? <>
         <div className="profile-cover"><div className={`avatar profile-avatar ${profile.username === session.username ? 'mine' : ''}`}>{initials(profile.displayName)}</div></div>
         <div className="profile-info"><div><h1>{profile.displayName}</h1><p>{profile.username}</p><span>Account ID {profile.accountId}</span></div><strong>{profile.posts.length}<small>bài viết</small></strong></div>
@@ -335,10 +322,9 @@ function App() {
     {editingPost && <div className="modal-backdrop edit-backdrop"><form className="edit-post-modal" onSubmit={savePostEdit}><header><h2>Chỉnh sửa bài viết</h2><button type="button" className="close" onClick={() => setEditingPost(null)}>×</button></header><div className="create-post-author"><span className="avatar mine">{initials(session.displayName)}</span><div><b>{session.displayName}</b><small>Chỉ chỉnh sửa nội dung chữ</small></div></div><textarea value={editCaption} onChange={(event) => setEditCaption(event.target.value)} placeholder="Viết nội dung cho bài viết…" maxLength={5000} autoFocus/><div className="edit-preview"><img src={editingPost.image} alt="Ảnh bài viết"/><span>Ảnh và watermark được giữ nguyên</span></div><button className="create-post-submit">Lưu thay đổi</button></form></div>}
     {photoViewer && <div className="photo-viewer">
       <button className="viewer-close" onClick={() => { setPhotoViewer(null); setViewerMenu(false) }} aria-label="Đóng">×</button>
-      <div className="photo-stage"><img src={photoViewer.image} alt={photoViewer.post.caption || 'Ảnh bài viết'}/><div className="viewer-menu-wrap"><button className="viewer-menu-button" onClick={() => setViewerMenu((current) => !current)} aria-label="Tùy chọn">•••</button>{viewerMenu && <div className="viewer-menu"><button onClick={() => { downloadImage(photoViewer.image, photoViewer.post.id); setViewerMenu(false) }}><Icon name="download"/><span><b>Lưu ảnh</b><small>Tải ảnh watermark về máy</small></span></button>{photoViewer.post.username !== session.username && !photoViewer.post.licenses?.some((license) => license.ownerUsername === session.username) && <button className="copyright-option" onClick={() => { setVerifyPost({ ...photoViewer.post, image: photoViewer.image }); setVerification(null); setSelectedAssetId(''); setViewerMenu(false) }}><Icon name="flag"/><span><b>Nghi ngờ vi phạm bản quyền</b><small>Kiểm tra ảnh bằng watermark của bạn</small></span></button>}</div>}</div></div>
+      <div className="photo-stage"><img src={photoViewer.image} alt={photoViewer.post.caption || 'Ảnh bài viết'}/><div className="viewer-menu-wrap"><button className="viewer-menu-button" onClick={() => setViewerMenu((current) => !current)} aria-label="Tùy chọn">•••</button>{viewerMenu && <div className="viewer-menu"><button onClick={() => { downloadImage(photoViewer.image, photoViewer.post.id); setViewerMenu(false) }}><Icon name="download"/><span><b>Lưu ảnh</b><small>Tải ảnh watermark về máy</small></span></button></div>}</div></div>
       <aside className="viewer-panel"><div className="post-head"><span className={`avatar ${photoViewer.post.username === session.username ? 'mine' : ''}`}>{initials(photoViewer.post.author)}</span><div><b>{photoViewer.post.author}</b><small>{timeLabel(photoViewer.post.createdAt)} · ID {photoViewer.post.accountId}</small></div></div>{photoViewer.post.licenses && photoViewer.post.licenses.length > 0 && <div className="licensed-post-label viewer-license"><Icon name="shield"/><span>Được <b>{photoViewer.post.licenses[0].ownerDisplayName}</b> cho phép sử dụng · Account ID {photoViewer.post.licenses[0].ownerAccountId}</span></div>}{photoViewer.post.caption && photoViewer.post.caption !== 'Ảnh không có tiêu đề' && <p className="viewer-caption">{photoViewer.post.caption}</p>}<div className="viewer-stats"><span>{photoViewer.post.likes} lượt thích</span><span>{(photoViewer.post.comments || []).length} bình luận</span></div><div className="viewer-actions"><button className={photoViewer.post.liked ? 'liked' : ''} onClick={() => like(photoViewer.post.id)}><Icon name="heart"/>Thích</button><button><Icon name="comment"/>Bình luận</button></div><div className="viewer-comments">{(photoViewer.post.comments || []).length === 0 ? <p className="no-comments">Chưa có bình luận nào.</p> : photoViewer.post.comments.map((item) => <div className="comment-row" key={item.id}><span className={`avatar comment-avatar ${item.username === session.username ? 'mine' : ''}`}>{initials(item.author)}</span><div><b>{item.author}</b><p>{item.text}</p><small>{timeLabel(item.createdAt)}</small></div></div>)}</div><form className="comment-composer viewer-comment" onSubmit={(event) => comment(event, photoViewer.post.id)}><span className="avatar comment-avatar mine">{initials(session.displayName)}</span><input value={commentDrafts[photoViewer.post.id] || ''} onChange={(event) => setCommentDrafts((current) => ({ ...current, [photoViewer.post.id]: event.target.value }))} placeholder="Viết bình luận…" maxLength={1000}/><button disabled={!commentDrafts[photoViewer.post.id]?.trim()}>Gửi</button></form></aside>
     </div>}
-    {verifyPost && <div className="modal-backdrop verification-backdrop"><section className="modal verification-modal"><button className="close" onClick={() => { if (verification?.matched) setPhotoViewer(null); setVerifyPost(null); setVerification(null) }}>×</button><div className="verification-heading"><span className="modal-icon"><Icon name="shield"/></span><div><h2>Xác minh quyền sở hữu</h2><p className="muted">Đối chiếu watermark của ảnh đang xem với bằng chứng của bạn.</p></div></div><div className="suspect suspect-large"><img src={verifyPost.image}/><div><small>Ảnh đang được kiểm tra</small><b>Bài viết của {verifyPost.author}</b><span>Account ID người đăng: {verifyPost.accountId}</span></div></div>{(verifyPost.images?.length || 0) > 1 && <div className="suspect-picker"><small>Chọn ảnh cần kiểm tra trong bài viết</small><div>{verifyPost.images!.map((image, index) => <button className={verifyPost.image === image ? 'selected' : ''} onClick={() => { setVerifyPost({ ...verifyPost, image }); setVerification(null) }} key={index}><img src={image} alt={`Ảnh nghi ngờ ${index + 1}`}/></button>)}</div></div>}{!verification && <><div className="tabs verification-tabs"><button className={verifyMode === 'vault' ? 'selected' : ''} onClick={() => setVerifyMode('vault')}>Chọn ảnh trong kho của tôi</button><button className={verifyMode === 'file' ? 'selected' : ''} onClick={() => setVerifyMode('file')}>Tải key `.npz` từ máy</button></div>{verifyMode === 'vault' ? <><div className="vault-picker">{assets.length === 0 ? <div className="vault-picker-empty"><Icon name="image"/><span>Kho bản quyền chưa có ảnh.</span></div> : assets.map((asset) => <button className={selectedAssetId === asset.id ? 'selected' : ''} onClick={() => setSelectedAssetId(asset.id)} key={asset.id}><img src={asset.image} alt={asset.caption || 'Ảnh bản quyền'}/><span><b>{asset.caption || 'Ảnh bản quyền'}</b><small>ID {asset.accountId}</small></span><i>{selectedAssetId === asset.id ? '✓' : ''}</i></button>)}</div><button className="primary wide verify-submit" disabled={!chosenAsset || busy} onClick={() => chosenAsset && verify(chosenAsset.keyBase64, chosenAsset.caption || 'Ảnh từ kho')}>{busy ? 'Đang trích xuất watermark…' : 'Xác minh và xử lý vi phạm'}</button></> : <div className="key-drop key-drop-large"><Icon name="shield"/><b>Chọn file key `.npz` của ảnh</b><small>Hệ thống sẽ trích xuất Account ID và tự động gỡ bài nếu xác nhận vi phạm.</small><button onClick={() => keyInput.current?.click()}>Chọn key từ máy</button><input ref={keyInput} className="hidden" type="file" accept=".npz" onChange={readKey}/></div>}</>}{verification && <div className={verification.matched ? 'verification-result-card matched' : 'verification-result-card unmatched'}><span className="result-mark">{verification.matched ? '✓' : '!'}</span><div><small>{verification.matched ? 'ĐÃ XÁC MINH VÀ XỬ LÝ' : 'KHÔNG ĐỦ BẰNG CHỨNG'}</small><h3>{verification.matched ? 'Bài viết vi phạm đã được gỡ bỏ' : 'Watermark không khớp'}</h3><p>{verification.message}</p><div className="identity-proof"><div><span>Chủ sở hữu watermark</span><b>{verification.extractedOwner || 'Không xác định'}</b></div><div><span>Account ID trích xuất</span><b>{verification.extractedId || 'Không đọc được'}</b></div><div><span>Độ tin cậy</span><b>{verification.confidence ?? 0}%</b></div></div></div></div>}</section></div>}
   </div>
 }
 export default App
