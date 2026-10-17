@@ -161,11 +161,6 @@ def read_file_bytes(path: Path) -> bytes:
         return source.read()
 
 
-def write_file_bytes(path: Path, value: bytes) -> None:
-    with open(native_path(path), "wb") as destination:
-        destination.write(value)
-
-
 def read_image(path: Path) -> np.ndarray:
     """Read through NumPy so Windows long paths work with OpenCV."""
     source = native_path(path)
@@ -311,49 +306,18 @@ def embed_image(host: np.ndarray, account_id: str) -> dict:
         raise
 
 
-def preserve_verified_derivative(host: np.ndarray, source_asset: dict) -> dict:
-    """Store an edited image whose existing watermark still verifies for its owner."""
-    artifact_id = str(uuid.uuid4())
-    marked_path = RUNTIME / f"{artifact_id}_watermarked.jpg"
-    key_path = RUNTIME / f"{artifact_id}_key.npz"
-    try:
-        write_image(marked_path, host)
-        write_file_bytes(key_path, read_file_bytes(RUNTIME / source_asset["keyFile"]))
-        verification = extract_identity_with_key(
-            read_image(marked_path), load_key_file(native_path(key_path))
-        )
-        if not verification["matched"]:
-            raise ValueError("Watermark không còn đọc được sau khi lưu ảnh đã chỉnh sửa.")
-        return {"id": artifact_id, "imageFile": marked_path.name, "keyFile": key_path.name}
-    except Exception:
-        for path in (marked_path, key_path): unlink_file(path)
-        raise
-
-
-def registry_record(
-    artifact: dict,
-    owner_username: str,
-    user: dict,
-    source: np.ndarray | None = None,
-    parent_asset_id: str = "",
-    source_has_watermark: bool = False,
-) -> dict:
+def registry_record(artifact: dict, owner_username: str, user: dict) -> dict:
     marked_path = RUNTIME / artifact["imageFile"]
     marked = read_image(marked_path)
-    record = {
+    return {
         "id": artifact["id"], "ownerUsername": owner_username,
         "ownerDisplayName": user.get("displayName", owner_username),
         "ownerAccountId": str(user.get("accountId", "")),
         "imageFile": artifact["imageFile"], "keyFile": artifact["keyFile"],
-        "sourceSha256": "" if source is None or source_has_watermark else image_sha256(source),
         "watermarkedSha256": image_sha256(marked),
-        "sourcePHash": "" if source is None or source_has_watermark else image_phash(source),
         "watermarkedPHash": image_phash(marked),
         "createdAt": datetime.now(timezone.utc).isoformat(),
     }
-    if parent_asset_id:
-        record["parentAssetId"] = parent_asset_id
-    return record
 
 
 def ensure_asset_registry() -> list[dict]:
@@ -381,6 +345,8 @@ def ensure_asset_registry() -> list[dict]:
                     continue
         for item in registry:
             original_file = item.pop("originalFile", "")
+            item.pop("sourceSha256", None)
+            item.pop("sourcePHash", None)
             if (original_file and Path(original_file).name == original_file and
                     original_file.endswith("_original.jpg")):
                 unlink_file(RUNTIME / original_file)
@@ -393,13 +359,6 @@ def ensure_asset_registry() -> list[dict]:
 def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
     query_sha, query_phash = image_sha256(image), image_phash(image)
     for item in registry:
-        if query_sha == item.get("sourceSha256"):
-            return {
-                **item, "matchMethod": "sha256-source", "pHashDistance": 0,
-                "siftMatches": 0, "siftInliers": 0, "watermarkStatus": "source-original",
-                "extractedId": "", "extractionConfidence": 0.0,
-                "extractionCandidatesChecked": 0,
-            }
         if query_sha == item.get("watermarkedSha256"):
             extraction = extract_registry_identity(image, item)
             return {
@@ -414,10 +373,7 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
 
     candidates = []
     for item in registry:
-        distance = min(
-            phash_distance(query_phash, item.get("sourcePHash", "")),
-            phash_distance(query_phash, item.get("watermarkedPHash", "")),
-        )
+        distance = phash_distance(query_phash, item.get("watermarkedPHash", ""))
         if distance <= PHASH_SHORTLIST_DISTANCE:
             candidates.append((distance, item))
     geometric_matches = []
@@ -511,7 +467,7 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
     current_draft_hash = draft_fingerprint(caption, hosts)
     artifacts, created_artifacts, new_records = [], [], []
     used_permissions = []
-    reused_count = licensed_count = derived_count = 0
+    licensed_count = 0
     try:
         with DATA_LOCK:
             registry = ensure_asset_registry()
@@ -549,57 +505,21 @@ def create_post(image_data: str | list[str], caption: str, username: str, user: 
                         extractionConfidence=conflict["extractionConfidence"],
                     )
                     raise ProvenanceConflict(conflict)
-                if matched:
-                    same_owner = matched.get("ownerUsername") == username
-                    exact_match = matched.get("matchMethod") in {
-                        "sha256-source", "sha256-watermarked",
-                    }
-                    if same_owner and not exact_match:
-                        watermark_verified = (
-                            matched.get("watermarkStatus") == "verified" and
-                            matched.get("extractedId") == str(user.get("accountId", ""))
-                        )
-                        if watermark_verified:
-                            try:
-                                artifact = preserve_verified_derivative(host, matched)
-                                record = registry_record(
-                                    artifact, username, user, host,
-                                    parent_asset_id=matched.get("id", ""),
-                                    source_has_watermark=True,
-                                )
-                                record["registrationMethod"] = "derived-verified"
-                                record["watermarkStatus"] = "verified"
-                            except (FileNotFoundError, OSError, ValueError):
-                                watermark_verified = False
-                        if not watermark_verified:
-                            artifact = embed_image(host, user["accountId"])
-                            record = registry_record(
-                                artifact, username, user, host,
-                                parent_asset_id=matched.get("id", ""),
-                            )
-                            record["registrationMethod"] = "derived-embedded"
-                            record["watermarkStatus"] = "embedded"
-                        artifacts.append(artifact); created_artifacts.append(artifact)
-                        new_records.append(record); registry.append(record)
-                        derived_count += 1
-                    else:
-                        artifacts.append(artifact_from_registry(matched))
-                        if same_owner:
-                            reused_count += 1
-                        else:
-                            licensed_count += 1; used_permissions.append(license_record)
+                if matched and matched.get("ownerUsername") != username:
+                    artifacts.append(artifact_from_registry(matched))
+                    licensed_count += 1; used_permissions.append(license_record)
                     continue
                 artifact = embed_image(host, user["accountId"])
-                record = registry_record(artifact, username, user, host)
+                record = registry_record(artifact, username, user)
                 record["registrationMethod"] = "new"
                 record["watermarkStatus"] = "embedded"
                 artifacts.append(artifact); created_artifacts.append(artifact)
                 new_records.append(record); registry.append(record)
 
             provenance = {
-                "status": "licensed" if licensed_count else "derived" if derived_count else "reused" if reused_count else "new",
-                "reusedCount": reused_count, "licensedCount": licensed_count,
-                "derivedCount": derived_count, "newCount": len(new_records) - derived_count,
+                "status": "licensed" if licensed_count else "new",
+                "licensedCount": licensed_count,
+                "newCount": len(new_records),
             }
             licenses = [{
                 "requestId": permission["id"], "assetId": permission["assetId"],

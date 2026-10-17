@@ -1,4 +1,4 @@
-# Kế hoạch chống nhúng watermark chồng
+# Kế hoạch kiểm tra nguồn gốc ảnh trước khi nhúng watermark
 
 ## Mục tiêu
 
@@ -18,16 +18,14 @@ người đăng đã được bảo vệ, hay ảnh đã được một tài kho
    Dừng ngay khi tìm được một ID hợp lệ trùng khớp.
 7. Xử lý kết quả:
    - Ảnh mới: nhúng Account ID, tạo key và đăng ký asset.
-   - Ảnh đã thuộc chính tài khoản: dùng lại ảnh watermark và key cũ, không nhúng lần hai.
+   - Ảnh không thuộc tài khoản khác: nhúng Account ID và tạo key mới, kể cả khi người đăng
+     đã từng đăng ảnh có nội dung giống hoặc trùng với ảnh này.
    - Ảnh thuộc tài khoản khác: chặn đăng trước khi nhúng, hiển thị chủ sở hữu và Account ID;
      người đăng có thể gửi yêu cầu sử dụng.
 
 Nếu SIFT + RANSAC xác nhận ảnh cùng nguồn nhưng watermark đã bị crop/nén/resize quá mạnh nên
 không đọc lại được ID, hệ thống vẫn xem đây là ảnh liên quan thay vì ảnh mới. Giao diện phải ghi
 rõ trạng thái **không khôi phục được ID**, không được giả vờ rằng bước trích xuất đã thành công.
-
-Ảnh nguồn trùng tuyệt đối là trường hợp riêng: nó chưa từng chứa watermark, vì vậy hệ thống xác
-nhận bằng SHA-256 của ảnh nguồn và không chạy bước trích xuất vốn chắc chắn không có dữ liệu để đọc.
 
 ## Quy trình cấp quyền đăng lại
 
@@ -57,7 +55,8 @@ thái `pending` để quản trị viên xử lý. Thao tác này không tự x�
 bài và không tạo sự kiện vi phạm trong Nhật ký bản quyền trước khi quản trị viên kết luận.
 
 Registry cục bộ nằm tại `backend/runtime/asset_registry.json`. Mỗi asset giữ dấu vân tay
-của cả ảnh nguồn và ảnh watermark, chủ sở hữu, file ảnh và file key.
+của ảnh watermark, chủ sở hữu, file ảnh đã bảo vệ và file key. Ảnh tải lên chỉ được đối chiếu
+với các ảnh watermark trong kho; hệ thống không lưu hoặc đối chiếu với tệp ảnh gốc.
 
 ## Lộ trình khi chuyển sang quy mô thật
 
