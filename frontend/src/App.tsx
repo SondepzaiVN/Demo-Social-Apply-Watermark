@@ -12,7 +12,7 @@ const AUTH_STORAGE = 'watermark-social-session-v2'
 type Session = { token: string; username: string; accountId: string; displayName: string }
 type Comment = { id: string; username: string; author: string; text: string; createdAt: string }
 type ImageLicense = { requestId: string; assetId: string; ownerUsername: string; ownerDisplayName: string; ownerAccountId: string; approvedAt: string }
-type Post = { id: string; username: string; author: string; accountId: string; caption: string; image: string; images?: string[]; createdAt: string; likes: number; liked: boolean; comments: Comment[]; reported: boolean; provenance?: { status: 'new' | 'reused' | 'licensed'; reusedCount: number; licensedCount?: number; newCount: number }; licenses?: ImageLicense[] }
+type Post = { id: string; username: string; author: string; accountId: string; caption: string; image: string; images?: string[]; createdAt: string; likes: number; liked: boolean; comments: Comment[]; reported: boolean; provenance?: { status: 'new' | 'reused' | 'derived' | 'licensed'; reusedCount: number; derivedCount?: number; licensedCount?: number; newCount: number }; licenses?: ImageLicense[] }
 type Asset = Post & { keyBase64: string }
 type CopyrightEvent = { id: string; type: 'asset_registered' | 'upload_blocked' | 'license_requested' | 'license_approved' | 'license_denied' | 'licensed_post_published'; createdAt: string; perspective: 'owner' | 'requester'; ownerDisplayName: string; ownerAccountId: string; actorDisplayName: string; actorAccountId: string; caption?: string; image?: string; matchMethod?: string; watermarkStatus?: string; extractedId?: string; extractionConfidence?: number }
 type Notification = { id: string; type: string; title: string; message: string; ownerName: string; ownerAccountId: string; postCaption: string; createdAt: string; read: boolean; requestId?: string; requestStatus?: 'pending' | 'approved' | 'denied' | 'published'; requesterName?: string; requesterAccountId?: string; draftCaption?: string; draftImages?: string[]; licensedImageIndex?: number }
@@ -182,7 +182,7 @@ function App() {
     try {
       const post = await request<Post>('/posts', { method: 'POST', body: JSON.stringify({ images: pendingImages, caption }) }, session.token)
       setPosts((current) => [post, ...current]); setCaption(''); setPendingImages([]); setComposerOpen(false)
-      setNotice(post.provenance?.licensedCount ? `Đã đăng ảnh theo quyền sử dụng được cấp. Watermark của chủ sở hữu được giữ nguyên và bài viết đã ghi rõ nguồn.` : post.provenance?.reusedCount ? `Đã nhận diện ${post.provenance.reusedCount} ảnh thuộc kho của bạn và dùng lại watermark cũ; không nhúng chồng lần hai.` : `Đã đăng ${post.images?.length || 1} ảnh và lưu key bản quyền thành công.`)
+      setNotice(post.provenance?.licensedCount ? `Đã đăng ảnh theo quyền sử dụng được cấp. Watermark của chủ sở hữu được giữ nguyên và bài viết đã ghi rõ nguồn.` : post.provenance?.derivedCount ? `Đã giữ ${post.provenance.derivedCount} phiên bản ảnh bạn vừa chỉnh sửa và cập nhật thông tin bảo vệ tương ứng.` : post.provenance?.reusedCount ? `Đã nhận diện ${post.provenance.reusedCount} ảnh trùng hoàn toàn trong kho của bạn và dùng lại hồ sơ bản quyền hiện có.` : `Đã đăng ${post.images?.length || 1} ảnh và lưu key bản quyền thành công.`)
       const own = await request<Asset[]>('/assets', {}, session.token); setAssets(own)
     }
     catch (reason) {
