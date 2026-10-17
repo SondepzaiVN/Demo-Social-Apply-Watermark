@@ -23,9 +23,10 @@ người đăng đã được bảo vệ, hay ảnh đã được một tài kho
    - Ảnh thuộc tài khoản khác: chặn đăng trước khi nhúng, hiển thị chủ sở hữu và Account ID;
      người đăng có thể gửi yêu cầu sử dụng.
 
-Nếu SIFT + RANSAC xác nhận ảnh cùng nguồn nhưng watermark đã bị crop/nén/resize quá mạnh nên
-không đọc lại được ID, hệ thống vẫn xem đây là ảnh liên quan thay vì ảnh mới. Giao diện phải ghi
-rõ trạng thái **không khôi phục được ID**, không được giả vờ rằng bước trích xuất đã thành công.
+Kết quả pHash, SIFT và RANSAC chỉ được dùng để chọn những ảnh cần thử trích xuất. Hệ thống
+chỉ xác nhận xung đột khi đọc được Account ID hợp lệ và ID này trùng với chủ sở hữu của ảnh
+trong registry. Nếu không đọc được ID hoặc ID không khớp, ảnh vẫn được phép đăng và được
+nhúng Account ID của người đăng.
 
 ## Quy trình cấp quyền đăng lại
 

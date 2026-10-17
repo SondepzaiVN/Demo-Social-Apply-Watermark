@@ -361,7 +361,7 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
     for item in registry:
         if query_sha == item.get("watermarkedSha256"):
             extraction = extract_registry_identity(image, item)
-            return {
+            exact_match = {
                 **item, "matchMethod": "sha256-watermarked", "pHashDistance": 0,
                 "siftMatches": 0, "siftInliers": 0,
                 "watermarkStatus": "verified" if extraction["matched"] else "not-extracted",
@@ -370,6 +370,8 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
                 "extractionError": extraction.get("error", ""),
                 "extractionCandidatesChecked": 1,
             }
+            if extraction["matched"]:
+                return exact_match
 
     candidates = []
     for item in registry:
@@ -424,12 +426,9 @@ def registered_match(image: np.ndarray, registry: list[dict]) -> dict | None:
             enriched["matchMethod"] = "phash+sift+watermark"
             return enriched
 
-    # A geometrically strong match may be an original image that never contained a watermark,
-    # or a heavily attacked copy. Keep it related to the registered asset, but expose that the
-    # embedded identity could not be recovered instead of incorrectly treating it as a new image.
-    best_match = extraction_results[0]
-    best_match["extractionCandidatesChecked"] = len(extraction_results)
-    return best_match
+    # Visual similarity only selects candidates. A conflict is confirmed only when the
+    # extracted Account ID agrees with the registered owner.
+    return None
 
 
 def artifact_from_registry(item: dict) -> dict:
