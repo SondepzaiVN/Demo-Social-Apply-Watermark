@@ -21,6 +21,15 @@ type LicenseCenter = { incoming: LicenseRequestSummary[]; outgoing: LicenseReque
 type AccountSummary = { username: string; displayName: string; accountId: string; postCount: number }
 type Profile = { username: string; displayName: string; accountId: string; posts: Post[] }
 type ProvenanceDetails = { imageIndex: number; assetId: string; ownerUsername: string; ownerDisplayName: string; ownerAccountId: string; registeredAt: string; matchMethod: string; pHashDistance?: number; siftMatches?: number; siftInliers?: number; watermarkStatus?: 'verified' | 'source-original' | 'not-extracted'; extractedId?: string; extractionConfidence?: number; extractionCandidatesChecked?: number; geometricCandidateCount?: number }
+type ReportReason = 'copyright' | 'impersonation' | 'inappropriate' | 'spam' | 'other'
+
+const REPORT_REASONS: { value: ReportReason; label: string; description: string }[] = [
+  { value: 'copyright', label: 'Vi phạm bản quyền', description: 'Sử dụng hình ảnh hoặc tác phẩm khi chưa được phép.' },
+  { value: 'impersonation', label: 'Giả mạo', description: 'Mạo danh cá nhân, tổ chức hoặc chủ sở hữu nội dung.' },
+  { value: 'inappropriate', label: 'Nội dung không phù hợp', description: 'Nội dung gây hại, phản cảm hoặc vi phạm tiêu chuẩn cộng đồng.' },
+  { value: 'spam', label: 'Spam', description: 'Nội dung lặp lại, quảng cáo rác hoặc gây phiền nhiễu.' },
+  { value: 'other', label: 'Lý do khác', description: 'Một vấn đề khác cần quản trị viên xem xét.' },
+]
 
 class ApiError extends Error {
   code?: string
@@ -123,6 +132,10 @@ function App() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [provenanceConflict, setProvenanceConflict] = useState<ProvenanceDetails | null>(null)
   const [licenseBusy, setLicenseBusy] = useState(false)
+  const [reportTarget, setReportTarget] = useState<{post: Post; image: string} | null>(null)
+  const [reportReason, setReportReason] = useState<ReportReason>('copyright')
+  const [reportDetail, setReportDetail] = useState('')
+  const [reportBusy, setReportBusy] = useState(false)
   const imageInput = useRef<HTMLInputElement>(null)
 
   const signOut = useCallback(async () => {
@@ -215,6 +228,20 @@ function App() {
   }
   function downloadKey(asset: Asset) { const bytes = Uint8Array.from(atob(asset.keyBase64), (character) => character.charCodeAt(0)); const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `watermark-${asset.id}.npz`; anchor.click(); URL.revokeObjectURL(url) }
   function downloadImage(image: string, postId: string) { const anchor = document.createElement('a'); anchor.href = image; anchor.download = `watermark-social-${postId}.jpg`; anchor.click() }
+  function openReport(post: Post, image: string) { setReportTarget({ post, image }); setReportReason('copyright'); setReportDetail(''); setViewerMenu(false) }
+  function closeReport() { if (reportBusy) return; setReportTarget(null); setReportDetail('') }
+  async function submitReport(event: FormEvent) {
+    event.preventDefault(); if (!session || !reportTarget) return
+    const images = reportTarget.post.images || [reportTarget.post.image]
+    const imageIndex = Math.max(0, images.indexOf(reportTarget.image))
+    setReportBusy(true)
+    try {
+      const result = await request<{ok:boolean; alreadyExists:boolean}>('/report', { method: 'POST', body: JSON.stringify({ postId: reportTarget.post.id, imageIndex, reason: reportReason, detail: reportDetail }) }, session.token)
+      closeReport(); setReportTarget(null)
+      setNotice(result.alreadyExists ? 'Báo cáo này đang chờ quản trị viên xem xét.' : 'Đã gửi báo cáo đến quản trị viên. Bài viết sẽ được giữ nguyên trong khi chờ xem xét.')
+    } catch (reason) { setNotice(reason instanceof Error ? reason.message : 'Không thể gửi báo cáo.') }
+    finally { setReportBusy(false) }
+  }
   async function toggleNotifications() {
     const next = !notificationsOpen; setNotificationsOpen(next)
     if (next && session && notifications.some((item) => !item.read)) {
@@ -322,9 +349,10 @@ function App() {
     {editingPost && <div className="modal-backdrop edit-backdrop"><form className="edit-post-modal" onSubmit={savePostEdit}><header><h2>Chỉnh sửa bài viết</h2><button type="button" className="close" onClick={() => setEditingPost(null)}>×</button></header><div className="create-post-author"><span className="avatar mine">{initials(session.displayName)}</span><div><b>{session.displayName}</b><small>Chỉ chỉnh sửa nội dung chữ</small></div></div><textarea value={editCaption} onChange={(event) => setEditCaption(event.target.value)} placeholder="Viết nội dung cho bài viết…" maxLength={5000} autoFocus/><div className="edit-preview"><img src={editingPost.image} alt="Ảnh bài viết"/><span>Ảnh và watermark được giữ nguyên</span></div><button className="create-post-submit">Lưu thay đổi</button></form></div>}
     {photoViewer && <div className="photo-viewer">
       <button className="viewer-close" onClick={() => { setPhotoViewer(null); setViewerMenu(false) }} aria-label="Đóng">×</button>
-      <div className="photo-stage"><img src={photoViewer.image} alt={photoViewer.post.caption || 'Ảnh bài viết'}/><div className="viewer-menu-wrap"><button className="viewer-menu-button" onClick={() => setViewerMenu((current) => !current)} aria-label="Tùy chọn">•••</button>{viewerMenu && <div className="viewer-menu"><button onClick={() => { downloadImage(photoViewer.image, photoViewer.post.id); setViewerMenu(false) }}><Icon name="download"/><span><b>Lưu ảnh</b><small>Tải ảnh watermark về máy</small></span></button></div>}</div></div>
+      <div className="photo-stage"><img src={photoViewer.image} alt={photoViewer.post.caption || 'Ảnh bài viết'}/><div className="viewer-menu-wrap"><button className="viewer-menu-button" onClick={() => setViewerMenu((current) => !current)} aria-label="Tùy chọn">•••</button>{viewerMenu && <div className="viewer-menu"><button onClick={() => { downloadImage(photoViewer.image, photoViewer.post.id); setViewerMenu(false) }}><Icon name="download"/><span><b>Lưu ảnh</b><small>Tải ảnh watermark về máy</small></span></button>{photoViewer.post.username !== session.username && <button className="copyright-option" onClick={() => openReport(photoViewer.post, photoViewer.image)}><Icon name="flag"/><span><b>Báo cáo bài viết</b><small>Gửi nội dung này đến quản trị viên</small></span></button>}</div>}</div></div>
       <aside className="viewer-panel"><div className="post-head"><span className={`avatar ${photoViewer.post.username === session.username ? 'mine' : ''}`}>{initials(photoViewer.post.author)}</span><div><b>{photoViewer.post.author}</b><small>{timeLabel(photoViewer.post.createdAt)} · ID {photoViewer.post.accountId}</small></div></div>{photoViewer.post.licenses && photoViewer.post.licenses.length > 0 && <div className="licensed-post-label viewer-license"><Icon name="shield"/><span>Được <b>{photoViewer.post.licenses[0].ownerDisplayName}</b> cho phép sử dụng · Account ID {photoViewer.post.licenses[0].ownerAccountId}</span></div>}{photoViewer.post.caption && photoViewer.post.caption !== 'Ảnh không có tiêu đề' && <p className="viewer-caption">{photoViewer.post.caption}</p>}<div className="viewer-stats"><span>{photoViewer.post.likes} lượt thích</span><span>{(photoViewer.post.comments || []).length} bình luận</span></div><div className="viewer-actions"><button className={photoViewer.post.liked ? 'liked' : ''} onClick={() => like(photoViewer.post.id)}><Icon name="heart"/>Thích</button><button><Icon name="comment"/>Bình luận</button></div><div className="viewer-comments">{(photoViewer.post.comments || []).length === 0 ? <p className="no-comments">Chưa có bình luận nào.</p> : photoViewer.post.comments.map((item) => <div className="comment-row" key={item.id}><span className={`avatar comment-avatar ${item.username === session.username ? 'mine' : ''}`}>{initials(item.author)}</span><div><b>{item.author}</b><p>{item.text}</p><small>{timeLabel(item.createdAt)}</small></div></div>)}</div><form className="comment-composer viewer-comment" onSubmit={(event) => comment(event, photoViewer.post.id)}><span className="avatar comment-avatar mine">{initials(session.displayName)}</span><input value={commentDrafts[photoViewer.post.id] || ''} onChange={(event) => setCommentDrafts((current) => ({ ...current, [photoViewer.post.id]: event.target.value }))} placeholder="Viết bình luận…" maxLength={1000}/><button disabled={!commentDrafts[photoViewer.post.id]?.trim()}>Gửi</button></form></aside>
     </div>}
+    {reportTarget && <div className="modal-backdrop moderation-report-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeReport() }}><form className="moderation-report-modal" onSubmit={submitReport}><header><span className="report-modal-icon"><Icon name="flag"/></span><div><small>BÁO CÁO NỘI DUNG</small><h2>Báo cáo bài viết</h2></div><button type="button" className="close" onClick={closeReport}>×</button></header><div className="report-post-preview"><img src={reportTarget.image} alt="Ảnh được báo cáo"/><div><small>Bài viết của</small><b>{reportTarget.post.author}</b><span>Account ID {reportTarget.post.accountId}</span></div></div><fieldset><legend>Vì sao bạn báo cáo bài viết này?</legend>{REPORT_REASONS.map((reason) => <label className={reportReason === reason.value ? 'selected' : ''} key={reason.value}><input type="radio" name="report-reason" value={reason.value} checked={reportReason === reason.value} onChange={() => setReportReason(reason.value)}/><span><b>{reason.label}</b><small>{reason.description}</small></span><i>{reportReason === reason.value ? '✓' : ''}</i></label>)}</fieldset><label className="report-detail-label">Thông tin bổ sung <span>Không bắt buộc</span><textarea value={reportDetail} onChange={(event) => setReportDetail(event.target.value)} maxLength={1000} placeholder="Mô tả ngắn để quản trị viên hiểu rõ vấn đề…"/></label><p className="report-review-note"><Icon name="shield"/><span>Báo cáo sẽ được chuyển đến quản trị viên để xem xét. Bài viết không bị tự động xóa.</span></p><footer><button type="button" className="secondary" onClick={closeReport}>Hủy</button><button type="submit" className="submit-report" disabled={reportBusy}>{reportBusy ? 'Đang gửi…' : 'Gửi báo cáo'}</button></footer></form></div>}
   </div>
 }
 export default App

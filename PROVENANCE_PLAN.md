@@ -51,6 +51,11 @@ việc đăng ký ảnh mới, chặn lượt đăng ảnh trùng, gửi yêu c�
 đã được cấp quyền. File key `.npz` vẫn được chủ sở hữu tải về làm bằng chứng dự phòng, nhưng
 không còn là thao tác bắt buộc trong luồng kiểm tra chính của giao diện.
 
+Nút **Báo cáo bài viết** là một luồng kiểm duyệt độc lập. Người dùng chọn lý do và có thể
+gửi mô tả bổ sung; báo cáo được lưu vào `backend/runtime/moderation_reports.json` với trạng
+thái `pending` để quản trị viên xử lý. Thao tác này không tự xác minh watermark, không tự gỡ
+bài và không tạo sự kiện vi phạm trong Nhật ký bản quyền trước khi quản trị viên kết luận.
+
 Registry cục bộ nằm tại `backend/runtime/asset_registry.json`. Mỗi asset giữ dấu vân tay
 của cả ảnh nguồn và ảnh watermark, chủ sở hữu, file ảnh và file key.
 

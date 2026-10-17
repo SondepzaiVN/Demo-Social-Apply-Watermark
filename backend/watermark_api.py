@@ -19,10 +19,11 @@ from models.watermark_pipeline import (  # noqa: E402
 
 RUNTIME = Path(__file__).resolve().parent / "runtime"
 RUNTIME.mkdir(exist_ok=True)
-USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTRY_FILE, LICENSES_FILE, COPYRIGHT_LOG_FILE = (
+USERS_FILE, POSTS_FILE, SESSIONS_FILE, HISTORY_FILE, NOTIFICATIONS_FILE, REGISTRY_FILE, LICENSES_FILE, COPYRIGHT_LOG_FILE, REPORTS_FILE = (
     RUNTIME / name for name in (
         "users.json", "posts.json", "sessions.json", "verification_history.json",
         "notifications.json", "asset_registry.json", "license_requests.json", "copyright_log.json",
+        "moderation_reports.json",
     )
 )
 DATA_LOCK = threading.RLock()
@@ -704,41 +705,45 @@ def account_identity(account_id: str) -> str:
     return ""
 
 
-def report_post(post_id: str, username: str, history_id: str) -> dict:
+def report_post(post_id: str, image_index: int, reason: str, detail: str,
+                username: str, user: dict) -> dict:
+    """Queue a user report for moderators; reporting never removes a post automatically."""
+    allowed_reasons = {"copyright", "impersonation", "inappropriate", "spam", "other"}
+    if reason not in allowed_reasons:
+        raise ValueError("Lý do báo cáo không hợp lệ.")
+    detail = detail.strip()
+    if len(detail) > 1000:
+        raise ValueError("Nội dung bổ sung không được vượt quá 1000 ký tự.")
     with DATA_LOCK:
         posts = read_json(POSTS_FILE, [])
         post = next((item for item in posts if item["id"] == post_id), None)
         if not post: raise ValueError("Bài viết không tồn tại.")
         if post.get("username") == username: raise PermissionError("Bạn không thể báo cáo bài viết của chính mình.")
-        history = read_json(HISTORY_FILE, [])
-        proof = next((item for item in history if item.get("id") == history_id and item.get("username") == username and item.get("postId") == post_id), None)
-        if not proof or not proof.get("matched"):
-            raise PermissionError("Cần xác minh watermark hợp lệ trước khi gỡ bài viết.")
         artifacts = post.get("artifacts", [])
-        image_index = min(max(0, int(proof.get("imageIndex", 0))), max(0, len(artifacts) - 1))
+        image_index = min(max(0, int(image_index)), max(0, len(artifacts) - 1))
         asset_id = artifacts[image_index].get("id", "") if artifacts else ""
-        permission = next((item for item in post.get("licenses", []) if
-                           item.get("assetId") == asset_id and
-                           item.get("ownerUsername") == username), None)
-        if permission:
-            raise PermissionError("Bạn đã cấp quyền sử dụng ảnh này cho người đăng nên bài viết không vi phạm bản quyền.")
-        users = read_json(USERS_FILE, {})
-        claimant = users.get(username, {})
-        claimant_name = claimant.get("displayName", "Chủ sở hữu")
-        claimant_id = claimant.get("accountId", proof.get("extractedId", ""))
-        notifications = read_json(NOTIFICATIONS_FILE, [])
-        notifications.insert(0, {
-            "id": str(uuid.uuid4()), "username": post["username"], "type": "copyright_removal",
-            "title": "Bài viết đã bị gỡ do vi phạm bản quyền",
-            "message": f"Một hình ảnh trong bài viết của bạn đã được xác minh thuộc quyền sở hữu của {claimant_name} (Account ID {claimant_id}). Bài viết đã được gỡ để bảo vệ quyền tác giả.",
-            "ownerName": claimant_name, "ownerAccountId": claimant_id,
-            "postCaption": post.get("caption", ""), "createdAt": datetime.now(timezone.utc).isoformat(), "read": False,
-        })
-        proof["action"] = "post_removed"
-        posts = [item for item in posts if item["id"] != post_id]
-        write_json(POSTS_FILE, posts); write_json(HISTORY_FILE, history); write_json(NOTIFICATIONS_FILE, notifications[:500])
-        release_unreferenced_assets(post, posts)
-    return {"ok": True, "removedPostId": post_id}
+        reports = read_json(REPORTS_FILE, [])
+        existing = next((item for item in reports if
+                         item.get("postId") == post_id and
+                         item.get("reporterUsername") == username and
+                         item.get("status") == "pending"), None)
+        if existing:
+            return {"ok": True, "reportId": existing["id"], "status": "pending",
+                    "alreadyExists": True}
+        record = {
+            "id": str(uuid.uuid4()), "status": "pending", "reason": reason,
+            "detail": detail, "postId": post_id, "imageIndex": image_index,
+            "assetId": asset_id, "postUsername": post.get("username", ""),
+            "postAuthor": post.get("author", ""), "postAccountId": post.get("accountId", ""),
+            "postCaption": post.get("caption", ""), "reporterUsername": username,
+            "reporterDisplayName": user.get("displayName", username),
+            "reporterAccountId": str(user.get("accountId", "")),
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+        reports.insert(0, record)
+        write_json(REPORTS_FILE, reports[:1000])
+    return {"ok": True, "reportId": record["id"], "status": "pending",
+            "alreadyExists": False}
 
 
 def verify(image_data: str, key_base64: str, owner_id: str) -> dict:
@@ -1107,7 +1112,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/api/comments": result = add_comment(payload["postId"], payload.get("text", ""), username, user)
                 elif self.path == "/api/posts/edit": result = edit_post(payload["postId"], payload.get("caption", ""), username)
                 elif self.path == "/api/posts/delete": result = delete_post(payload["postId"], username)
-                elif self.path == "/api/report": result = report_post(payload["postId"], username, payload.get("historyId", ""))
+                elif self.path == "/api/report": result = report_post(
+                    payload["postId"], payload.get("imageIndex", 0),
+                    payload.get("reason", "other"), payload.get("detail", ""), username, user,
+                )
                 elif self.path == "/api/licenses/request": result = request_image_license(payload["assetId"], payload, username, user)
                 elif self.path == "/api/licenses/respond": result = respond_image_license(payload["requestId"], payload["decision"], username)
                 elif self.path == "/api/licenses/publish": result = publish_approved_license(payload["requestId"], username, user)
